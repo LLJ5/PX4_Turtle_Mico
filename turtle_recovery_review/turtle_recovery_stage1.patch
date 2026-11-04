@@ -1,0 +1,673 @@
+diff --git a/boards/micoair/h743-v2/default.px4board b/boards/micoair/h743-v2/default.px4board
+index 9f6d00a5d0..40f624b1f0 100644
+--- a/boards/micoair/h743-v2/default.px4board
++++ b/boards/micoair/h743-v2/default.px4board
+@@ -80,6 +80,7 @@ CONFIG_MODULES_PAYLOAD_DELIVERER=y
+ CONFIG_MODULES_RC_UPDATE=y
+ CONFIG_MODULES_SENSORS=y
+ CONFIG_MODULES_TEMPERATURE_COMPENSATION=y
++CONFIG_MODULES_TURTLE_RECOVERY=y
+ CONFIG_MODULES_UXRCE_DDS_CLIENT=y
+ CONFIG_MODULES_VTOL_ATT_CONTROL=y
+ CONFIG_SYSTEMCMDS_ACTUATOR_TEST=y
+diff --git a/src/modules/turtle_recovery/Kconfig b/src/modules/turtle_recovery/Kconfig
+new file mode 100644
+index 0000000000..9f99d7e7a5
+--- /dev/null
++++ b/src/modules/turtle_recovery/Kconfig
+@@ -0,0 +1,6 @@
++menuconfig MODULES_TURTLE_RECOVERY
++	bool "turtle_recovery"
++	default n
++	---help---
++		Observe RC input, attitude and motor geometry for turtle recovery.
++		This development module does not control actuators or send ESC commands.
+diff --git a/src/modules/turtle_recovery/CMakeLists.txt b/src/modules/turtle_recovery/CMakeLists.txt
+new file mode 100644
+index 0000000000..0771008a39
+--- /dev/null
++++ b/src/modules/turtle_recovery/CMakeLists.txt
+@@ -0,0 +1,44 @@
++############################################################################
++#
++# Copyright (c) 2026 PX4 Development Team. All rights reserved.
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions
++# are met:
++#
++# 1. Redistributions of source code must retain the above copyright
++#    notice, this list of conditions and the following disclaimer.
++# 2. Redistributions in binary form must reproduce the above copyright
++#    notice, this list of conditions and the following disclaimer in
++#    the documentation and/or other materials provided with the
++#    distribution.
++# 3. Neither the name PX4 nor the names of its contributors may be
++#    used to endorse or promote products derived from this software
++#    without specific prior written permission.
++#
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++# OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++# AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++# POSSIBILITY OF SUCH DAMAGE.
++#
++############################################################################
++
++px4_add_module(
++	MODULE modules__turtle_recovery
++	MAIN turtle_recovery
++	SRCS
++		TurtleRecovery.cpp
++		TurtleObserver.hpp
++	DEPENDS
++		px4_work_queue
++)
++
++px4_add_unit_gtest(SRC TurtleObserverTest.cpp)
+diff --git a/src/modules/turtle_recovery/turtle_recovery_params.c b/src/modules/turtle_recovery/turtle_recovery_params.c
+new file mode 100644
+index 0000000000..10a72023e6
+--- /dev/null
++++ b/src/modules/turtle_recovery/turtle_recovery_params.c
+@@ -0,0 +1,56 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++
++/**
++ * Enable turtle recovery observation
++ *
++ * Enables RC switch observation only. The turtle_recovery module must be
++ * started manually. It never drives motors or sends ESC commands.
++ *
++ * @boolean
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_INT32(TRTL_OBS_EN, 0);
++
++/**
++ * Turtle observation AUX input
++ *
++ * Selects manual_control_setpoint AUX1 through AUX6. Map a spare RC channel
++ * using the corresponding RC_MAP_AUX parameter. Observe requests require
++ * a valid RC source, a disarmed vehicle, and an OFF to ON switch transition.
++ *
++ * @min 1
++ * @max 6
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_INT32(TRTL_AUX, 1);
+diff --git a/src/modules/turtle_recovery/TurtleObserver.hpp b/src/modules/turtle_recovery/TurtleObserver.hpp
+new file mode 100644
+index 0000000000..594c1d4285
+--- /dev/null
++++ b/src/modules/turtle_recovery/TurtleObserver.hpp
+@@ -0,0 +1,121 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <matrix/matrix/math.hpp>
++
++namespace turtle_recovery
++{
++
++// Alignment of body +Z with earth down. No Euler angle conversion is needed.
++inline bool attitudeAlignment(const float q[4], float &alignment)
++{
++	alignment = NAN;
++	matrix::Quatf attitude{q};
++	const float norm = attitude.norm();
++
++	if (!std::isfinite(norm) || fabsf(norm - 1.f) > 0.02f) {
++		return false;
++	}
++
++	attitude.normalize();
++	alignment = matrix::Dcmf{attitude}(2, 2);
++	return true;
++}
++
++// Logical motor indices, not physical output channels. Only a conventional
++// four-rotor layout with two motors on either side is supported in this stage.
++inline bool rightMotorMask(const float position_y[4], uint32_t &mask)
++{
++	mask = 0;
++	unsigned right_count = 0;
++	unsigned left_count = 0;
++
++	for (unsigned i = 0; i < 4; ++i) {
++		if (!std::isfinite(position_y[i]) || fabsf(position_y[i]) < 1e-4f) {
++			mask = 0;
++			return false;
++		}
++
++		if (position_y[i] > 0.f) {
++			mask |= 1u << i;
++			++right_count;
++
++		} else {
++			++left_count;
++		}
++	}
++
++	if (right_count != 2 || left_count != 2) {
++		mask = 0;
++		return false;
++	}
++
++	return true;
++}
++
++class ObserveTrigger
++{
++public:
++	bool update(bool available, float aux)
++	{
++		if (!available || !std::isfinite(aux) || aux < -1.f || aux > 1.f) {
++			reset();
++			return false;
++		}
++
++		if (aux < -0.5f) {
++			_seen_off = true;
++			_active = false;
++
++		} else if (aux > 0.5f && _seen_off && !_active) {
++			_active = true;
++			return true;
++		}
++
++		return false;
++	}
++
++	void reset() { _seen_off = false; _active = false; }
++	bool active() const { return _active; }
++	bool seenOff() const { return _seen_off; }
++
++private:
++	bool _seen_off{false};
++	bool _active{false};
++};
++
++} // namespace turtle_recovery
+diff --git a/src/modules/turtle_recovery/TurtleRecovery.cpp b/src/modules/turtle_recovery/TurtleRecovery.cpp
+new file mode 100644
+index 0000000000..a17c0bc866
+--- /dev/null
++++ b/src/modules/turtle_recovery/TurtleRecovery.cpp
+@@ -0,0 +1,273 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++
++#include "TurtleObserver.hpp"
++
++#include <drivers/drv_hrt.h>
++#include <mathlib/mathlib.h>
++#include <parameters/param.h>
++#include <px4_platform_common/module.h>
++#include <px4_platform_common/module_params.h>
++#include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
++#include <uORB/Subscription.hpp>
++#include <uORB/SubscriptionInterval.hpp>
++#include <uORB/topics/manual_control_setpoint.h>
++#include <uORB/topics/parameter_update.h>
++#include <uORB/topics/vehicle_angular_velocity.h>
++#include <uORB/topics/vehicle_attitude.h>
++#include <uORB/topics/vehicle_land_detected.h>
++#include <uORB/topics/vehicle_status.h>
++
++using namespace time_literals;
++
++class TurtleRecovery : public ModuleBase<TurtleRecovery>, public ModuleParams, public px4::ScheduledWorkItem
++{
++public:
++	TurtleRecovery() : ModuleParams(nullptr), ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::lp_default)
++	{
++		updateGeometry();
++	}
++
++	static int task_spawn(int argc, char *argv[]);
++	static int custom_command(int argc, char *argv[]) { return print_usage("unknown command"); }
++	static int print_usage(const char *reason = nullptr);
++	int print_status() override;
++
++private:
++	void Run() override;
++	void updateGeometry();
++	float auxInput() const;
++	static bool fresh(hrt_abstime now, hrt_abstime timestamp, hrt_abstime timeout)
++	{
++		return timestamp != 0 && now >= timestamp && now - timestamp <= timeout;
++	}
++
++	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
++	uORB::Subscription _manual_sub{ORB_ID(manual_control_setpoint)};
++	uORB::Subscription _attitude_sub{ORB_ID(vehicle_attitude)};
++	uORB::Subscription _angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
++	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
++	uORB::Subscription _land_sub{ORB_ID(vehicle_land_detected)};
++
++	manual_control_setpoint_s _manual{};
++	vehicle_attitude_s _attitude{};
++	vehicle_angular_velocity_s _angular_velocity{};
++	vehicle_status_s _vehicle_status{};
++	vehicle_land_detected_s _land{};
++	turtle_recovery::ObserveTrigger _trigger;
++
++	uint32_t _right_motor_mask{0};
++	unsigned _trigger_count{0};
++	float _position_y[4] {};
++	float _aux{NAN};
++	float _alignment{NAN};
++	float _tilt_deg{NAN};
++	float _roll_rate_deg_s{NAN};
++	bool _geometry_valid{false};
++	bool _rc_valid{false};
++	bool _attitude_valid{false};
++	bool _gyro_valid{false};
++	bool _status_valid{false};
++	bool _land_valid{false};
++
++	DEFINE_PARAMETERS(
++		(ParamBool<px4::params::TRTL_OBS_EN>) _param_obs_en,
++		(ParamInt<px4::params::TRTL_AUX>) _param_aux
++	)
++};
++
++void TurtleRecovery::updateGeometry()
++{
++	_geometry_valid = false;
++	_right_motor_mask = 0;
++	int32_t rotor_count = 0;
++
++	if (param_get(param_find("CA_ROTOR_COUNT"), &rotor_count) != PX4_OK || rotor_count != 4) {
++		return;
++	}
++
++	for (unsigned i = 0; i < 4; ++i) {
++		char name[17];
++		snprintf(name, sizeof(name), "CA_ROTOR%u_PY", i);
++
++		if (param_get(param_find(name), &_position_y[i]) != PX4_OK) {
++			return;
++		}
++	}
++
++	_geometry_valid = turtle_recovery::rightMotorMask(_position_y, _right_motor_mask);
++}
++
++float TurtleRecovery::auxInput() const
++{
++	switch (_param_aux.get()) {
++	case 1: return _manual.aux1;
++
++	case 2: return _manual.aux2;
++
++	case 3: return _manual.aux3;
++
++	case 4: return _manual.aux4;
++
++	case 5: return _manual.aux5;
++
++	case 6: return _manual.aux6;
++
++	default: return NAN;
++	}
++}
++
++void TurtleRecovery::Run()
++{
++	if (should_exit()) {
++		ScheduleClear();
++		exit_and_cleanup();
++		return;
++	}
++
++	if (_parameter_update_sub.updated()) {
++		parameter_update_s update;
++		_parameter_update_sub.copy(&update);
++		const bool previous_enable = _param_obs_en.get();
++		const int32_t previous_aux = _param_aux.get();
++		updateParams();
++		updateGeometry();
++
++		if (previous_enable != _param_obs_en.get() || previous_aux != _param_aux.get()) {
++			_trigger.reset();
++		}
++	}
++
++	_manual_sub.update(&_manual);
++	_attitude_sub.update(&_attitude);
++	_angular_velocity_sub.update(&_angular_velocity);
++	_vehicle_status_sub.update(&_vehicle_status);
++	_land_sub.update(&_land);
++
++	const hrt_abstime now = hrt_absolute_time();
++	_aux = auxInput();
++	_rc_valid = _manual.valid && _manual.data_source == manual_control_setpoint_s::SOURCE_RC
++		    && fresh(now, _manual.timestamp_sample, 300_ms) && PX4_ISFINITE(_aux) && fabsf(_aux) <= 1.f;
++	_status_valid = fresh(now, _vehicle_status.timestamp, 2_s);
++	_land_valid = fresh(now, _land.timestamp, 2_s);
++	_attitude_valid = fresh(now, _attitude.timestamp_sample, 100_ms)
++			  && turtle_recovery::attitudeAlignment(_attitude.q, _alignment);
++	_tilt_deg = _attitude_valid ? math::degrees(acosf(math::constrain(_alignment, -1.f, 1.f))) : NAN;
++
++	if (!_attitude_valid) {
++		_alignment = NAN;
++	}
++
++	_gyro_valid = fresh(now, _angular_velocity.timestamp_sample, 100_ms)
++		      && matrix::Vector3f{_angular_velocity.xyz}.isAllFinite();
++	_roll_rate_deg_s = _gyro_valid ? math::degrees(_angular_velocity.xyz[0]) : NAN;
++
++	const bool switch_available = _param_obs_en.get() && _rc_valid && _status_valid
++				      && _vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_DISARMED;
++
++	if (_trigger.update(switch_available, _aux)) {
++		++_trigger_count;
++		PX4_INFO("Observe request #%u: tilt %.1f deg, right mask 0x%x (no motor output)",
++			 _trigger_count, (double)_tilt_deg, (unsigned)_right_motor_mask);
++	}
++}
++
++int TurtleRecovery::print_status()
++{
++	PX4_INFO("Observation only: no actuator publications or ESC commands");
++	PX4_INFO("Enabled: %s, input: AUX%" PRId32, _param_obs_en.get() ? "yes" : "no", _param_aux.get());
++	PX4_INFO("RC: %s, AUX: %.2f, OFF seen: %s, observing: %s, requests: %u",
++		 _rc_valid ? "valid" : "invalid/stale", (double)_aux, _trigger.seenOff() ? "yes" : "no",
++		 _trigger.active() ? "yes" : "no", _trigger_count);
++	PX4_INFO("Vehicle: %s", !_status_valid ? "unknown/stale" :
++		 (_vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED ? "armed" : "disarmed"));
++	PX4_INFO("Attitude: %s, tilt: %.1f deg, body-down alignment: %.3f", _attitude_valid ? "valid" : "invalid/stale",
++		 (double)_tilt_deg, (double)_alignment);
++	PX4_INFO("Gyro: %s, roll rate: %.1f deg/s (+ = body-right roll)", _gyro_valid ? "valid" : "invalid/stale",
++		 (double)_roll_rate_deg_s);
++	PX4_INFO("Land detector (reference only): %s", !_land_valid ? "unknown/stale" :
++		 (_land.landed ? "landed" : "not landed"));
++	PX4_INFO("Geometry: %s, right logical motor mask: 0x%x", _geometry_valid ? "supported" : "unsupported",
++		 (unsigned)_right_motor_mask);
++
++	if (_geometry_valid) {
++		for (unsigned i = 0; i < 4; ++i) {
++			PX4_INFO("Motor %u: y=%.3f, %s", i + 1, (double)_position_y[i],
++				 (_right_motor_mask & (1u << i)) ? "RIGHT (would select)" : "LEFT");
++		}
++	}
++
++	return PX4_OK;
++}
++
++int TurtleRecovery::task_spawn(int argc, char *argv[])
++{
++	TurtleRecovery *instance = new TurtleRecovery();
++
++	if (instance) {
++		_object.store(instance);
++		_task_id = task_id_is_work_queue;
++		instance->ScheduleOnInterval(20_ms);
++		return PX4_OK;
++	}
++
++	PX4_ERR("alloc failed");
++	return PX4_ERROR;
++}
++
++int TurtleRecovery::print_usage(const char *reason)
++{
++	if (reason) {
++		PX4_WARN("%s", reason);
++	}
++
++	PRINT_MODULE_DESCRIPTION(R"DESCR_STR(
++### Description
++Observe RC input, quaternion attitude, roll rate and right-side motor geometry.
++This development stage has no motor output or ESC command path.
++Enable TRTL_OBS_EN and map a spare RC switch to the AUX input selected by TRTL_AUX.
++Only RC OFF-to-ON transitions while disarmed are counted. Starting with the switch
++ON or recovering from RC loss requires observing OFF before another request.
++Start manually; use status to inspect the inputs. This is not a readiness check
++or an automatic flip controller.
++)DESCR_STR");
++	PRINT_MODULE_USAGE_NAME("turtle_recovery", "system");
++	PRINT_MODULE_USAGE_COMMAND("start");
++	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
++	return PX4_OK;
++}
++
++extern "C" __EXPORT int turtle_recovery_main(int argc, char *argv[])
++{
++	return TurtleRecovery::main(argc, argv);
++}
+diff --git a/src/modules/turtle_recovery/TurtleObserverTest.cpp b/src/modules/turtle_recovery/TurtleObserverTest.cpp
+new file mode 100644
+index 0000000000..5de0b2bad8
+--- /dev/null
++++ b/src/modules/turtle_recovery/TurtleObserverTest.cpp
+@@ -0,0 +1,125 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++
++#include "TurtleObserver.hpp"
++#include <gtest/gtest.h>
++
++using namespace turtle_recovery;
++
++TEST(TurtleObserver, AttitudeAcrossFullRoll)
++{
++	for (int degrees = 0; degrees <= 360; ++degrees) {
++		const float angle = degrees * 0.017453292519943295f;
++		const float q[4] {cosf(angle / 2.f), sinf(angle / 2.f), 0.f, 0.f};
++		const float negative_q[4] {-q[0], -q[1], -q[2], -q[3]};
++		float alignment;
++		float negative_alignment;
++		ASSERT_TRUE(attitudeAlignment(q, alignment));
++		ASSERT_TRUE(attitudeAlignment(negative_q, negative_alignment));
++		EXPECT_NEAR(alignment, cosf(angle), 1e-5f);
++		EXPECT_FLOAT_EQ(alignment, negative_alignment);
++	}
++}
++
++TEST(TurtleObserver, PitchAtEulerSingularity)
++{
++	const float q[4] {sqrtf(0.5f), 0.f, sqrtf(0.5f), 0.f};
++	float alignment;
++	ASSERT_TRUE(attitudeAlignment(q, alignment));
++	EXPECT_NEAR(alignment, 0.f, 1e-5f);
++}
++
++TEST(TurtleObserver, InvalidAttitude)
++{
++	const float zero[4] {};
++	const float invalid[4] {NAN, 0.f, 0.f, 0.f};
++	const float scaled[4] {2.f, 0.f, 0.f, 0.f};
++	float alignment;
++	EXPECT_FALSE(attitudeAlignment(zero, alignment));
++	EXPECT_FALSE(attitudeAlignment(invalid, alignment));
++	EXPECT_FALSE(attitudeAlignment(scaled, alignment));
++	EXPECT_TRUE(std::isnan(alignment));
++}
++
++TEST(TurtleObserver, RightMotorsFollowGeometryInsteadOfMotorNumbers)
++{
++	const float px4_x[4] {1.f, -1.f, -1.f, 1.f};
++	const float remapped[4] {-1.f, 1.f, 1.f, -1.f};
++	const float plus[4] {0.f, -1.f, 1.f, 0.f};
++	const float invalid[4] {NAN, -1.f, -1.f, 1.f};
++	const float asymmetric[4] {1.f, 1.f, 1.f, -1.f};
++	uint32_t mask;
++	ASSERT_TRUE(rightMotorMask(px4_x, mask));
++	EXPECT_EQ(mask, 0x9u);
++	ASSERT_TRUE(rightMotorMask(remapped, mask));
++	EXPECT_EQ(mask, 0x6u);
++	EXPECT_FALSE(rightMotorMask(plus, mask));
++	EXPECT_EQ(mask, 0u);
++	EXPECT_FALSE(rightMotorMask(invalid, mask));
++	EXPECT_EQ(mask, 0u);
++	EXPECT_FALSE(rightMotorMask(asymmetric, mask));
++	EXPECT_EQ(mask, 0u);
++}
++
++TEST(TurtleObserver, StartsOnAndHeldOnDoNotRetrigger)
++{
++	ObserveTrigger trigger;
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	EXPECT_FALSE(trigger.active());
++	EXPECT_FALSE(trigger.update(true, -1.f));
++	EXPECT_TRUE(trigger.update(true, 1.f));
++	EXPECT_TRUE(trigger.active());
++
++	for (int i = 0; i < 100; ++i) {
++		EXPECT_FALSE(trigger.update(true, 1.f));
++	}
++
++	EXPECT_FALSE(trigger.update(true, -1.f));
++	EXPECT_FALSE(trigger.active());
++	EXPECT_TRUE(trigger.update(true, 1.f));
++}
++
++TEST(TurtleObserver, InvalidInputAndUnavailableRequireOffAgain)
++{
++	ObserveTrigger trigger;
++	trigger.update(true, -1.f);
++	ASSERT_TRUE(trigger.update(true, 1.f));
++	EXPECT_FALSE(trigger.update(false, 1.f));
++	EXPECT_FALSE(trigger.active());
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	trigger.update(true, -1.f);
++	EXPECT_FALSE(trigger.update(true, NAN));
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	trigger.update(true, -1.f);
++	EXPECT_TRUE(trigger.update(true, 1.f));
++}

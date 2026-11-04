@@ -1,0 +1,2820 @@
+diff --git a/boards/micoair/h743-v2/default.px4board b/boards/micoair/h743-v2/default.px4board
+index 9f6d00a5d0..40f624b1f0 100644
+--- a/boards/micoair/h743-v2/default.px4board
++++ b/boards/micoair/h743-v2/default.px4board
+@@ -80,6 +80,7 @@ CONFIG_MODULES_PAYLOAD_DELIVERER=y
+ CONFIG_MODULES_RC_UPDATE=y
+ CONFIG_MODULES_SENSORS=y
+ CONFIG_MODULES_TEMPERATURE_COMPENSATION=y
++CONFIG_MODULES_TURTLE_RECOVERY=y
+ CONFIG_MODULES_UXRCE_DDS_CLIENT=y
+ CONFIG_MODULES_VTOL_ATT_CONTROL=y
+ CONFIG_SYSTEMCMDS_ACTUATOR_TEST=y
+diff --git a/boards/micoair/h743-v2/init/rc.board_extras b/boards/micoair/h743-v2/init/rc.board_extras
+index e7653077db..cffd14c80b 100644
+--- a/boards/micoair/h743-v2/init/rc.board_extras
++++ b/boards/micoair/h743-v2/init/rc.board_extras
+@@ -5,3 +5,8 @@
+ 
+ # enable onboard OSD chip
+ # atxxxx start -s
++
++if param compare TRTL_ENABLE 1
++then
++	turtle_recovery start
++fi
+diff --git a/msg/CMakeLists.txt b/msg/CMakeLists.txt
+index 7eda1cc316..437745b1e9 100644
+--- a/msg/CMakeLists.txt
++++ b/msg/CMakeLists.txt
+@@ -219,6 +219,8 @@ set(msg_files
+ 	TrajectorySetpoint6dof.msg
+ 	TransponderReport.msg
+ 	TuneControl.msg
++	TurtleRecoveryControl.msg
++	TurtleRecoveryFeedback.msg
+ 	UavcanParameterRequest.msg
+ 	UavcanParameterValue.msg
+ 	UlogStream.msg
+diff --git a/msg/TurtleRecoveryControl.msg b/msg/TurtleRecoveryControl.msg
+new file mode 100644
+index 0000000000..453e48e465
+--- /dev/null
++++ b/msg/TurtleRecoveryControl.msg
+@@ -0,0 +1,8 @@
++# Internal leased request, consumed only by the DShot recovery backend.
++uint64 timestamp
++uint64 session_id
++uint8 ACTION_STOP = 0
++uint8 ACTION_PREPARE = 1
++uint8 ACTION_DRIVE = 2
++uint8 action
++float32 throttle # [0, 0.8] DShot throttle fraction, not thrust, physical power or RPM
+diff --git a/msg/TurtleRecoveryFeedback.msg b/msg/TurtleRecoveryFeedback.msg
+new file mode 100644
+index 0000000000..330e0470ab
+--- /dev/null
++++ b/msg/TurtleRecoveryFeedback.msg
+@@ -0,0 +1,15 @@
++# DShot backend state. Direction restoration is TX completion, not ESC acknowledgement.
++uint64 timestamp
++uint64 session_id
++uint8 STATE_IDLE = 0
++uint8 STATE_STOP_REVERSE = 1
++uint8 STATE_REVERSING = 2
++uint8 STATE_READY = 3
++uint8 STATE_DRIVING = 4
++uint8 STATE_STOP_RESTORE = 5
++uint8 STATE_RESTORING = 6
++uint8 state
++uint8 result # 0: normal stop/cleanup; 1: watchdog or permission failure
++bool busy
++bool direction_dirty
++float32 throttle
+diff --git a/src/drivers/dshot/CMakeLists.txt b/src/drivers/dshot/CMakeLists.txt
+index 82f7c3db51..a2fc117b05 100644
+--- a/src/drivers/dshot/CMakeLists.txt
++++ b/src/drivers/dshot/CMakeLists.txt
+@@ -44,6 +44,7 @@ px4_add_module(
+ 		-DPARAM_PREFIX="${PARAM_PREFIX}"
+ 	SRCS
+ 		DShot.cpp
++		DShotTurtleCommand.hpp
+ 		DShotTelemetry.cpp
+ 	DEPENDS
+ 		arch_io_pins
+@@ -52,3 +53,5 @@ px4_add_module(
+ 	MODULE_CONFIG
+ 		module.yaml
+ 	)
++
++px4_add_unit_gtest(SRC DShotTurtleCommandTest.cpp)
+diff --git a/src/drivers/dshot/DShot.cpp b/src/drivers/dshot/DShot.cpp
+index 92fec8e76e..7885eedc41 100644
+--- a/src/drivers/dshot/DShot.cpp
++++ b/src/drivers/dshot/DShot.cpp
+@@ -36,6 +36,7 @@
+ #include <px4_arch/io_timer.h>
+ 
+ #include <px4_platform_common/sem.hpp>
++#include <matrix/matrix/math.hpp>
+ 
+ char DShot::_telemetry_device[] {};
+ bool DShot::_telemetry_swap_rxtx{false};
+@@ -337,8 +338,35 @@ int DShot::handle_new_bdshot_erpm(void)
+ 
+ int DShot::send_command_thread_safe(const dshot_command_t command, const int num_repetitions, const int motor_index)
+ {
++	if (_recovery_busy.load()) {
++		PX4_ERR("automatic turtle recovery is active");
++		return -EBUSY;
++	}
++
+ 	Command cmd{};
+ 	cmd.command = command;
++	cmd.turtle_direction = command == DShot_cmd_spin_direction_normal || command == DShot_cmd_spin_direction_reversed;
++	cmd.logical_motor = motor_index;
++	cmd.requested_at = hrt_absolute_time();
++
++	if (cmd.turtle_direction && (motor_index < 0 || motor_index >= actuator_motors_s::NUM_CONTROLS)) {
++		return -EINVAL;
++	}
++
++	if (cmd.turtle_direction) {
++		bool expected = false;
++
++		if (!_turtle_busy.compare_exchange(&expected, true)) {
++			PX4_ERR("temporary direction command busy");
++			return -EBUSY;
++		}
++
++		_turtle_state.store(static_cast<int>(DShotTurtleCommand::State::Queued));
++
++	} else if (_turtle_busy.load()) {
++		PX4_ERR("wait for temporary direction command to finish");
++		return -EBUSY;
++	}
+ 
+ 	if (motor_index == -1) {
+ 		cmd.motor_mask = 0xff;
+@@ -347,8 +375,21 @@ int DShot::send_command_thread_safe(const dshot_command_t command, const int num
+ 		cmd.motor_mask = 1 << motor_index;
+ 	}
+ 
++	if (cmd.turtle_direction) {
++		cmd.motor_mask = 0; // resolved and latched in the output worker
++	}
++
+ 	cmd.num_repetitions = num_repetitions;
+-	_new_command.store(&cmd);
++	Command *expected_command = nullptr;
++
++	if (!_new_command.compare_exchange(&expected_command, &cmd)) {
++		if (cmd.turtle_direction) {
++			_turtle_state.store(static_cast<int>(DShotTurtleCommand::State::Aborted));
++			_turtle_busy.store(false);
++		}
++
++		return -EBUSY;
++	}
+ 
+ 	hrt_abstime timestamp_for_timeout = hrt_absolute_time();
+ 
+@@ -359,7 +400,15 @@ int DShot::send_command_thread_safe(const dshot_command_t command, const int num
+ 			px4_usleep(1000);
+ 
+ 		} else {
+-			_new_command.store(nullptr);
++			Command *pending = &cmd;
++
++			if (_new_command.compare_exchange(&pending, nullptr) && cmd.turtle_direction) {
++				_turtle_state.store(static_cast<int>(DShotTurtleCommand::State::TimedOut));
++				_turtle_busy.store(false);
++				PX4_ERR("temporary direction queue timeout");
++				return -ETIMEDOUT;
++			}
++
+ 			PX4_WARN("DShot command timeout!");
+ 		}
+ 	}
+@@ -372,6 +421,122 @@ void DShot::mixerChanged()
+ 	update_num_motors();
+ }
+ 
++turtle_recovery::OutputFrame DShot::recoveryFrame(uint16_t *outputs, unsigned count)
++{
++	using namespace turtle_recovery;
++	static_assert(static_cast<uint8_t>(Action::Stop) == turtle_recovery_control_s::ACTION_STOP
++		      && static_cast<uint8_t>(Action::Prepare) == turtle_recovery_control_s::ACTION_PREPARE
++		      && static_cast<uint8_t>(Action::Drive) == turtle_recovery_control_s::ACTION_DRIVE, "Recovery action mismatch");
++	static_assert(static_cast<uint8_t>(OutputState::Idle) == turtle_recovery_feedback_s::STATE_IDLE
++		      && static_cast<uint8_t>(OutputState::Ready) == turtle_recovery_feedback_s::STATE_READY
++		      && static_cast<uint8_t>(OutputState::Driving) == turtle_recovery_feedback_s::STATE_DRIVING
++		      && static_cast<uint8_t>(OutputState::Restoring) == turtle_recovery_feedback_s::STATE_RESTORING,
++		      "Recovery feedback mismatch");
++	_recovery_control_sub.update(&_recovery_control);
++	_recovery_manual_sub.update(&_recovery_manual);
++	_recovery_attitude_sub.update(&_recovery_attitude);
++	_recovery_gyro_sub.update(&_recovery_gyro);
++	_recovery_land_sub.update(&_recovery_land);
++	_recovery_status_sub.update(&_recovery_status);
++	const uint64_t now = hrt_absolute_time();
++	const auto fresh = [now](uint64_t t, uint64_t limit) { return t != 0 && now >= t && now - t < limit; };
++	const auto &armed = _mixing_output.armed();
++	OutputPermission p{};
++	p.enabled = _turtle_enabled;
++	p.stop_safe = fresh(armed.timestamp, 2000000) && !armed.armed && !armed.kill && !armed.lockdown
++		      && !armed.termination && !armed.in_esc_calibration_mode;
++	p.normal_outputs_stopped = true;
++	p.available_mask = _output_mask;
++	p.throttle_limit = _recovery_limit;
++	unsigned seen[4] {};
++	uint16_t all_mask = 0;
++	bool extra_motor = false;
++
++	for (unsigned i = 0; i < count; ++i) {
++		const int motor = static_cast<int>(_mixing_output.outputFunction(i)) - static_cast<int>(OutputFunction::Motor1);
++
++		if (motor >= 0 && motor < actuator_motors_s::NUM_CONTROLS) {
++			p.normal_outputs_stopped &= outputs[i] == DSHOT_DISARM_VALUE;
++
++			if (motor < 4 && i < 8 && (_output_mask & (1u << i))) {
++				++seen[motor];
++				all_mask |= 1u << i;
++
++				if (motor == 0 || motor == 3) { p.right_mask |= 1u << i; }
++
++			} else { extra_motor = true; }
++		}
++	}
++
++	const bool mapping_valid = !extra_motor && seen[0] == 1 && seen[1] == 1 && seen[2] == 1 && seen[3] == 1;
++
++	if (!mapping_valid || !_recovery_geometry) { p.right_mask = 0; }
++
++	const float aux[] {_recovery_manual.aux1, _recovery_manual.aux2, _recovery_manual.aux3,
++			   _recovery_manual.aux4, _recovery_manual.aux5, _recovery_manual.aux6
++			  };
++	const float selected_aux = _recovery_aux >= 1 && _recovery_aux <= 6 ? aux[_recovery_aux - 1] : NAN;
++	matrix::Quatf q{_recovery_attitude.q};
++	const bool attitude_valid = fresh(_recovery_attitude.timestamp_sample, 100000)
++				    && q.isAllFinite() && fabsf(q.norm() - 1.f) < 0.02f;
++
++	if (attitude_valid) { q.normalize(); }
++
++	const matrix::Dcmf rotation{q};
++	const matrix::Vector3f gyro{_recovery_gyro.xyz};
++	const bool rc_valid = _recovery_manual.valid && _recovery_manual.data_source == manual_control_setpoint_s::SOURCE_RC
++			      && std::isfinite(_rc_loss_timeout) && _rc_loss_timeout > 0.f
++			      && fresh(_recovery_manual.timestamp_sample, static_cast<uint64_t>(_rc_loss_timeout * 1e6f))
++			      && PX4_ISFINITE(selected_aux) && selected_aux > 0.5f && selected_aux <= 1.f
++			      && PX4_ISFINITE(_recovery_manual.throttle) && _recovery_manual.throttle < -0.8f;
++	const bool gyro_valid = fresh(_recovery_gyro.timestamp_sample, 100000) && gyro.isAllFinite() && gyro.norm() < 7.f;
++	const bool vehicle_valid = fresh(_recovery_status.timestamp, 2000000)
++				   && _recovery_status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING
++				   && (!_recovery_status.safety_button_available || _recovery_status.safety_off)
++				   && _recovery_status.power_input_valid && !_recovery_status.calibration_enabled
++				   && !_recovery_status.rc_calibration_in_progress && !_recovery_status.failsafe
++				   && (_recovery_status.failure_detector_status & ~3u) == 0;
++	p.live = rc_valid && attitude_valid && gyro_valid && vehicle_valid
++		 && !_param_dshot_3d_enable.get() && _reversible_outputs == 0;
++	p.entry = p.live && rotation(2, 2) < -0.8660254f && fabsf(rotation(2, 0)) < 0.35f
++		  && gyro.norm() < 0.174533f && fresh(_recovery_land.timestamp, 2000000) && _recovery_land.landed
++		  && !_current_command.valid() && _new_command.load() == nullptr && _manual_dirty_mask == 0;
++
++	if (_turtle_enabled && !_recovery_initialised && !_recovery.busy() && mapping_valid
++	    && !_current_command.valid() && _new_command.load() == nullptr && p.stop_safe && p.normal_outputs_stopped) {
++		_recovery.restore(now, all_mask);
++		_recovery_initialised = true;
++	}
++
++	Request request{};
++	request.timestamp = _recovery_control.timestamp;
++	request.session = _recovery_control.session_id;
++	request.action = static_cast<Action>(_recovery_control.action);
++	request.throttle = _recovery_control.throttle;
++
++	if (attitude_valid && rotation(2, 2) > 0.9063f && _recovery.state() == OutputState::Driving) {
++		request.action = Action::Stop; // independent upright stop guard
++	}
++
++	const auto frame = _recovery.update(now, request, p);
++	_recovery_busy.store(_recovery.busy() || (_turtle_enabled && !_recovery_initialised));
++	_recovery_throttle = frame.throttle;
++	return frame;
++}
++
++void DShot::publishRecoveryFeedback()
++{
++	turtle_recovery_feedback_s feedback{};
++	feedback.timestamp = hrt_absolute_time();
++	feedback.session_id = _recovery.session();
++	feedback.state = static_cast<uint8_t>(_recovery.state());
++	feedback.result = _recovery.result();
++	feedback.busy = _recovery.busy() || _turtle_busy.load() || (_turtle_enabled && !_recovery_initialised);
++	feedback.direction_dirty = _recovery.dirty() || _manual_dirty_mask != 0 || (_turtle_enabled && !_recovery_initialised);
++	feedback.throttle = _recovery_throttle;
++	_recovery_feedback_pub.publish(feedback);
++}
++
+ bool DShot::updateOutputs(uint16_t outputs[MAX_ACTUATORS],
+ 			  unsigned num_outputs, unsigned num_control_groups_updated)
+ {
+@@ -386,14 +551,74 @@ bool DShot::updateOutputs(uint16_t outputs[MAX_ACTUATORS],
+ 	}
+ 
+ 	int telemetry_index = 0;
++	const auto recovery_frame = recoveryFrame(outputs, num_outputs);
++	const bool turtle_direction = _current_command.valid() && _current_command.turtle_direction;
++	bool send_turtle_frame = false;
++
++	if (turtle_direction) {
++		// Resolve the logical Motor N function to an enabled physical DShot pin.
++		unsigned matches = 0;
++		uint8_t target_mask = 0;
++		bool all_motors_stopped = true;
++
++		for (unsigned i = 0; i < num_outputs; ++i) {
++			const int function = static_cast<int>(_mixing_output.outputFunction(i));
++
++			if (function >= static_cast<int>(OutputFunction::Motor1) && function <= static_cast<int>(OutputFunction::MotorMax)) {
++				all_motors_stopped &= outputs[i] == DSHOT_DISARM_VALUE;
++			}
++
++			if (function == static_cast<int>(OutputFunction::Motor1) + _current_command.logical_motor) {
++				++matches;
++
++				if (i < 8 && (_output_mask & (1u << i))) {
++					target_mask = 1u << i;
++				}
++			}
++		}
++
++		const auto &armed = _mixing_output.armed();
++		const bool permitted = !armed.armed && !armed.kill && !armed.lockdown && !armed.termination
++				       && !armed.in_esc_calibration_mode && !_param_dshot_3d_enable.get() && _reversible_outputs == 0;
++
++		if (_current_command.motor_mask == 0) {
++			_current_command.motor_mask = target_mask;
++		}
++
++		send_turtle_frame = _turtle_command.update(hrt_absolute_time(), permitted,
++				    matches == 1 && target_mask != 0 && target_mask == _current_command.motor_mask, all_motors_stopped);
++	}
+ 
+ 	for (int i = 0; i < (int)num_outputs; i++) {
++		if (recovery_frame.kind != turtle_recovery::FrameKind::None) {
++			outputs[i] = DSHOT_DISARM_VALUE;
++
++			if ((recovery_frame.mask & (1u << i)) && recovery_frame.kind == turtle_recovery::FrameKind::Throttle
++			    && recovery_frame.throttle > 0.f) {
++				outputs[i] = 1 + static_cast<uint16_t>(recovery_frame.throttle * (DSHOT_MAX_THROTTLE - 1));
++			}
++
++			if ((recovery_frame.mask & (1u << i)) && (recovery_frame.kind == turtle_recovery::FrameKind::Reverse
++					|| recovery_frame.kind == turtle_recovery::FrameKind::Restore)) {
++				up_dshot_motor_command(i, recovery_frame.kind == turtle_recovery::FrameKind::Reverse
++						       ? DShot_cmd_spin_direction_reversed : DShot_cmd_spin_direction_normal, true);
++
++			} else if (outputs[i] == DSHOT_DISARM_VALUE) {
++				up_dshot_motor_command(i, DShot_cmd_motor_stop, false);
++
++			} else {
++				up_dshot_motor_data_set(i, outputs[i], false);
++			}
++
++			continue;
++		}
+ 
+ 		uint16_t output = outputs[i];
+ 
+ 		if (output == DSHOT_DISARM_VALUE) {
+ 
+-			if (_current_command.valid() && (_current_command.motor_mask & (1 << i))) {
++			if (_current_command.valid() && (!turtle_direction || send_turtle_frame)
++			    && (_current_command.motor_mask & (1 << i))) {
+ 				up_dshot_motor_command(i, _current_command.command, true);
+ 
+ 			} else {
+@@ -414,7 +639,39 @@ bool DShot::updateOutputs(uint16_t outputs[MAX_ACTUATORS],
+ 	}
+ 
+ 	// Decrement the command counter
+-	if (_current_command.valid()) {
++	const auto previous_recovery_state = _recovery.state();
++	_recovery.frameSent(recovery_frame.kind);
++
++	if (previous_recovery_state == turtle_recovery::OutputState::Restoring
++	    && _recovery.state() == turtle_recovery::OutputState::Idle) {
++		// Automatic restore affects the two recovery motors (all four on startup).
++		_manual_dirty_mask &= _recovery.session() == 0 ? ~turtle_recovery::ALL_MOTORS : ~turtle_recovery::RIGHT_MOTORS;
++	}
++
++	if (turtle_direction) {
++		if (send_turtle_frame) {
++			if (_current_command.command == DShot_cmd_spin_direction_reversed) {
++				_manual_dirty_mask |= 1u << _current_command.logical_motor;
++			}
++
++			_turtle_command.frameSent();
++		}
++
++		_turtle_state.store(static_cast<int>(_turtle_command.state()));
++
++		if (_turtle_command.finished()) {
++			if (_turtle_command.state() == DShotTurtleCommand::State::Sent
++			    && _current_command.command == DShot_cmd_spin_direction_normal) {
++				_manual_dirty_mask &= ~(1u << _current_command.logical_motor);
++			}
++
++			PX4_INFO("Temporary direction Motor %d: %s", _current_command.logical_motor + 1,
++				 DShotTurtleCommand::name(_turtle_command.state()));
++			_current_command.clear();
++			_turtle_busy.store(false);
++		}
++
++	} else if (_current_command.valid()) {
+ 		--_current_command.num_repetitions;
+ 
+ 		// Queue a save command after the burst if save has been requested
+@@ -473,6 +730,7 @@ void DShot::Run()
+ 	perf_begin(_cycle_perf);
+ 
+ 	_mixing_output.update();
++	publishRecoveryFeedback();
+ 
+ 	// update output status if armed or if mixer is loaded
+ 	bool outputs_on = true;
+@@ -515,11 +773,16 @@ void DShot::Run()
+ 	}
+ 
+ 	// new command?
+-	if (!_current_command.valid()) {
++	if (!_current_command.valid() && !_recovery.busy()) {
+ 		Command *new_command = _new_command.load();
+ 
+ 		if (new_command) {
+ 			_current_command = *new_command;
++
++			if (_current_command.turtle_direction) {
++				_turtle_command.start(_current_command.requested_at);
++			}
++
+ 			_new_command.store(nullptr);
+ 		}
+ 	}
+@@ -581,7 +844,10 @@ void DShot::handle_vehicle_commands()
+ 			command_ack.target_component = vehicle_command.source_component;
+ 			command_ack.result = vehicle_command_ack_s::VEHICLE_CMD_RESULT_UNSUPPORTED;
+ 
+-			if (index != -1) {
++			if (_recovery_busy.load() || _manual_dirty_mask != 0) {
++				command_ack.result = vehicle_command_ack_s::VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED;
++
++			} else if (index != -1) {
+ 				PX4_DEBUG("setting command: index: %i type: %i", index, type);
+ 				_current_command.command = dshot_command_t::DShot_cmd_motor_stop;
+ 
+@@ -621,6 +887,27 @@ void DShot::update_params()
+ 	_parameter_update_sub.copy(&pupdate);
+ 
+ 	updateParams();
++	int32_t enabled = 0;
++	param_get(param_find("TRTL_ENABLE"), &enabled);
++
++	if (enabled != 0 && !_turtle_enabled) { _recovery_initialised = false; }
++
++	_turtle_enabled = enabled != 0;
++	param_get(param_find("TRTL_AUX"), &_recovery_aux);
++	param_get(param_find("TRTL_MAX_THR"), &_recovery_limit);
++	param_get(param_find("COM_RC_LOSS_T"), &_rc_loss_timeout);
++	int32_t rotor_count = 0, airframe = -1;
++	param_get(param_find("CA_ROTOR_COUNT"), &rotor_count);
++	param_get(param_find("CA_AIRFRAME"), &airframe);
++	_recovery_geometry = rotor_count == 4 && airframe == 0;
++
++	for (unsigned i = 0; i < 4; ++i) {
++		char name[17];
++		float y = NAN;
++		snprintf(name, sizeof(name), "CA_ROTOR%u_PY", i);
++		param_get(param_find(name), &y);
++		_recovery_geometry &= PX4_ISFINITE(y) && ((i == 0 || i == 3) ? y > 0.f : y < 0.f);
++	}
+ 
+ 	// we use a minimum value of 1, since 0 is for disarmed
+ 	_mixing_output.setAllMinValues(math::constrain(static_cast<int>((_param_dshot_min.get() *
+@@ -643,14 +930,24 @@ int DShot::custom_command(int argc, char *argv[])
+ 	int myoptind = 1;
+ 	bool swap_rxtx = false;
+ 	const char *device_name = nullptr;
++	const char *motor_argument = nullptr;
+ 	int ch;
+ 	const char *myoptarg = nullptr;
+ 
+ 	while ((ch = px4_getopt(argc, argv, "m:xd:", &myoptind, &myoptarg)) != EOF) {
+ 		switch (ch) {
+-		case 'm':
+-			motor_index = strtol(myoptarg, nullptr, 10) - 1;
+-			break;
++		case 'm': {
++				motor_argument = myoptarg;
++				char *end = nullptr;
++				const long motor = strtol(myoptarg, &end, 10);
++
++				if (end == myoptarg || *end != '\0' || motor < 0 || motor > 16) {
++					return print_usage("invalid motor index");
++				}
++
++				motor_index = static_cast<int>(motor) - 1;
++				break;
++			}
+ 
+ 		case 'x':
+ 			swap_rxtx = true;
+@@ -684,6 +981,8 @@ int DShot::custom_command(int argc, char *argv[])
+ 	};
+ 
+ 	constexpr VerbCommand commands[] = {
++		{"turtle_reverse", DShot_cmd_spin_direction_reversed, 10},
++		{"turtle_normal", DShot_cmd_spin_direction_normal, 10},
+ 		{"reverse", DShot_cmd_spin_direction_2, 10},
+ 		{"normal", DShot_cmd_spin_direction_1, 10},
+ 		{"save", DShot_cmd_save_settings, 10},
+@@ -698,12 +997,30 @@ int DShot::custom_command(int argc, char *argv[])
+ 
+ 	for (unsigned i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
+ 		if (!strcmp(verb, commands[i].name)) {
++			const bool turtle_direction = commands[i].command == DShot_cmd_spin_direction_normal
++						      || commands[i].command == DShot_cmd_spin_direction_reversed;
++
++			if (turtle_direction) {
++				char *end = nullptr;
++				const long motor = motor_argument ? strtol(motor_argument, &end, 10) : 0;
++
++				if (!motor_argument || end == motor_argument || *end != '\0' || motor < 1 || motor > actuator_motors_s::NUM_CONTROLS) {
++					return print_usage("specify one logical Motor with -m 1..12; remove all propellers");
++				}
++			}
++
+ 			if (!is_running()) {
+ 				PX4_ERR("module not running");
+ 				return -1;
+ 			}
+ 
+-			return get_instance()->send_command_thread_safe(commands[i].command, commands[i].num_repetitions, motor_index);
++			const int result = get_instance()->send_command_thread_safe(commands[i].command, commands[i].num_repetitions, motor_index);
++
++			if (result == PX4_OK && turtle_direction) {
++				PX4_INFO("Queued; check dshot status for TX completion, then verify direction with props removed");
++			}
++
++			return result;
+ 		}
+ 	}
+ 
+@@ -723,6 +1040,10 @@ int DShot::print_status()
+ 	PX4_INFO("Outputs initialized: %s", _outputs_initialized ? "yes" : "no");
+ 	PX4_INFO("Outputs used: 0x%" PRIx32, _output_mask);
+ 	PX4_INFO("Outputs on: %s", _outputs_on ? "yes" : "no");
++	PX4_INFO("Temporary direction: %s", DShotTurtleCommand::name(static_cast<DShotTurtleCommand::State>(_turtle_state.load())));
++	PX4_INFO("Automatic recovery: state %u, busy %s, direction dirty %s, throttle %.3f",
++		 static_cast<unsigned>(_recovery.state()), _recovery_busy.load() ? "yes" : "no",
++		 (_recovery.dirty() || _manual_dirty_mask != 0) ? "yes" : "no", (double)_recovery_throttle);
+ 	perf_print_counter(_cycle_perf);
+ 	perf_print_counter(_bdshot_rpm_perf);
+ 	perf_print_counter(_dshot_telem_perf);
+@@ -777,6 +1098,10 @@ After saving, the reversed direction will be regarded as the normal one. So to r
+ 	PRINT_MODULE_USAGE_PARAM_FLAG('x', "Swap RX/TX pins", true);
+ 
+ 	// DShot commands
++	PRINT_MODULE_USAGE_COMMAND_DESCR("turtle_reverse", "Props off: temporary reverse (21), disarmed only, no save");
++	PRINT_MODULE_USAGE_PARAM_INT('m', 1, 1, 12, "Logical Motor function (not output pin), required", false);
++	PRINT_MODULE_USAGE_COMMAND_DESCR("turtle_normal", "Props off: restore saved direction (20), disarmed only");
++	PRINT_MODULE_USAGE_PARAM_INT('m', 1, 1, 12, "Logical Motor function (not output pin), required", false);
+ 	PRINT_MODULE_USAGE_COMMAND_DESCR("reverse", "Reverse motor direction");
+ 	PRINT_MODULE_USAGE_PARAM_INT('m', -1, 0, 16, "Motor index (1-based, default=all)", true);
+ 	PRINT_MODULE_USAGE_COMMAND_DESCR("normal", "Normal motor direction");
+diff --git a/src/drivers/dshot/DShot.h b/src/drivers/dshot/DShot.h
+index 8137e461e2..b5712f570e 100644
+--- a/src/drivers/dshot/DShot.h
++++ b/src/drivers/dshot/DShot.h
+@@ -41,6 +41,15 @@
+ #include <uORB/topics/vehicle_command_ack.h>
+ 
+ #include "DShotTelemetry.h"
++#include "DShotTurtleCommand.hpp"
++#include <turtle_recovery/TurtleOutputGuard.hpp>
++#include <uORB/topics/turtle_recovery_control.h>
++#include <uORB/topics/turtle_recovery_feedback.h>
++#include <uORB/topics/manual_control_setpoint.h>
++#include <uORB/topics/vehicle_attitude.h>
++#include <uORB/topics/vehicle_angular_velocity.h>
++#include <uORB/topics/vehicle_land_detected.h>
++#include <uORB/topics/vehicle_status.h>
+ 
+ using namespace time_literals;
+ 
+@@ -111,9 +120,12 @@ private:
+ 		int num_repetitions{0};
+ 		uint8_t motor_mask{0xff};
+ 		bool save{false};
++		bool turtle_direction{false};
++		int logical_motor{-1};
++		hrt_abstime requested_at{0};
+ 
+ 		bool valid() const { return num_repetitions > 0; }
+-		void clear() { num_repetitions = 0; }
++		void clear() { num_repetitions = 0; turtle_direction = false; save = false; }
+ 	};
+ 
+ 	int _last_telemetry_index{-1};
+@@ -138,6 +150,8 @@ private:
+ 	void handle_vehicle_commands();
+ 
+ 	uint16_t convert_output_to_3d_scaling(uint16_t output);
++	turtle_recovery::OutputFrame recoveryFrame(uint16_t *outputs, unsigned count);
++	void publishRecoveryFeedback();
+ 
+ 	MixingOutput _mixing_output{PARAM_PREFIX, DIRECT_PWM_OUTPUT_CHANNELS, *this, MixingOutput::SchedulingPolicy::Auto, false, false};
+ 	uint32_t _reversible_outputs{};
+@@ -167,6 +181,28 @@ private:
+ 	perf_counter_t	_dshot_telem_perf{perf_alloc(PC_COUNT, MODULE_NAME": dshot telem")};
+ 
+ 	Command _current_command{};
++	DShotTurtleCommand _turtle_command;
++	px4::atomic_bool _turtle_busy{false};
++	px4::atomic<int> _turtle_state{static_cast<int>(DShotTurtleCommand::State::Idle)};
++	turtle_recovery::TurtleOutputGuard _recovery;
++	px4::atomic_bool _recovery_busy{false};
++	uint16_t _manual_dirty_mask{0};
++	bool _turtle_enabled{false}, _recovery_initialised{false}, _recovery_geometry{false};
++	int32_t _recovery_aux{1};
++	float _recovery_limit{0.12f}, _rc_loss_timeout{0.5f}, _recovery_throttle{0.f};
++	uORB::Subscription _recovery_control_sub{ORB_ID(turtle_recovery_control)};
++	uORB::Subscription _recovery_manual_sub{ORB_ID(manual_control_setpoint)};
++	uORB::Subscription _recovery_attitude_sub{ORB_ID(vehicle_attitude)};
++	uORB::Subscription _recovery_gyro_sub{ORB_ID(vehicle_angular_velocity)};
++	uORB::Subscription _recovery_land_sub{ORB_ID(vehicle_land_detected)};
++	uORB::Subscription _recovery_status_sub{ORB_ID(vehicle_status)};
++	turtle_recovery_control_s _recovery_control{};
++	manual_control_setpoint_s _recovery_manual{};
++	vehicle_attitude_s _recovery_attitude{};
++	vehicle_angular_velocity_s _recovery_gyro{};
++	vehicle_land_detected_s _recovery_land{};
++	vehicle_status_s _recovery_status{};
++	uORB::Publication<turtle_recovery_feedback_s> _recovery_feedback_pub{ORB_ID(turtle_recovery_feedback)};
+ 
+ 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
+ 	uORB::Subscription _vehicle_command_sub{ORB_ID(vehicle_command)};
+diff --git a/src/drivers/dshot/DShotTurtleCommand.hpp b/src/drivers/dshot/DShotTurtleCommand.hpp
+new file mode 100644
+index 0000000000..5569ad957c
+--- /dev/null
++++ b/src/drivers/dshot/DShotTurtleCommand.hpp
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// Copyright (c) 2026 PX4 Development Team. All rights reserved.
++
++#pragma once
++
++#include <cstdint>
++
++// 仅管理停机等待和命令发送，不产生电机油门，也不代表 ESC 已确认转向。
++class DShotTurtleCommand
++{
++public:
++	enum class State { Idle, Queued, WaitStop, Sending, Sent, Aborted, TimedOut };
++	static constexpr uint64_t STOP_WAIT_US = 500000;
++	static constexpr uint64_t TIMEOUT_US = 3000000;
++	static constexpr unsigned REPETITIONS = 10;
++
++	void start(uint64_t requested_at)
++	{
++		_started = requested_at;
++		_stopped_since = 0;
++		_remaining = REPETITIONS;
++		_state = State::WaitStop;
++	}
++
++	bool update(uint64_t now, bool permitted, bool target_valid, bool all_motors_stopped)
++	{
++		if (_state != State::WaitStop && _state != State::Sending) {
++			return false;
++		}
++
++		if (!permitted || !target_valid || now < _started) {
++			_state = State::Aborted;
++			return false;
++		}
++
++		if (now - _started >= TIMEOUT_US) {
++			_state = State::TimedOut;
++			return false;
++		}
++
++		if (!all_motors_stopped) {
++			if (_state == State::Sending) {
++				_state = State::Aborted;
++			}
++
++			_stopped_since = 0;
++			return false;
++		}
++
++		if (_state == State::WaitStop) {
++			if (_stopped_since == 0) {
++				_stopped_since = now;
++			}
++
++			if (now - _stopped_since < STOP_WAIT_US) {
++				return false;
++			}
++
++			_state = State::Sending;
++		}
++
++		return true;
++	}
++
++	void frameSent()
++	{
++		if (_state == State::Sending && --_remaining == 0) {
++			_state = State::Sent;
++		}
++	}
++
++	State state() const { return _state; }
++	bool finished() const { return _state == State::Sent || _state == State::Aborted || _state == State::TimedOut; }
++
++	static const char *name(State state)
++	{
++		switch (state) {
++		case State::Idle: return "idle";
++
++		case State::Queued: return "queued";
++
++		case State::WaitStop: return "waiting for stopped outputs";
++
++		case State::Sending: return "sending";
++
++		case State::Sent: return "TX complete (not ESC acknowledgement)";
++
++		case State::Aborted: return "aborted (arming, output, mapping or mode changed)";
++
++		case State::TimedOut: return "timed out";
++		}
++
++		return "unknown";
++	}
++
++private:
++	uint64_t _started{0};
++	uint64_t _stopped_since{0};
++	unsigned _remaining{0};
++	State _state{State::Idle};
++};
+diff --git a/src/drivers/dshot/DShotTurtleCommandTest.cpp b/src/drivers/dshot/DShotTurtleCommandTest.cpp
+new file mode 100644
+index 0000000000..88a1f7d564
+--- /dev/null
++++ b/src/drivers/dshot/DShotTurtleCommandTest.cpp
+@@ -0,0 +1,92 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// Copyright (c) 2026 PX4 Development Team. All rights reserved.
++
++#include "DShotTurtleCommand.hpp"
++#include <gtest/gtest.h>
++
++using State = DShotTurtleCommand::State;
++
++TEST(DShotTurtleCommand, WaitsForStopAndCountsOnlySentFrames)
++{
++	DShotTurtleCommand command;
++	command.start(1000000);
++	EXPECT_FALSE(command.update(1000000, true, true, true));
++	command.frameSent(); // Waiting cycles must not consume repetitions.
++	EXPECT_FALSE(command.update(1499999, true, true, true));
++	ASSERT_TRUE(command.update(1500000, true, true, true));
++
++	for (unsigned i = 0; i < 9; ++i) {
++		command.frameSent();
++		EXPECT_FALSE(command.finished());
++	}
++
++	command.frameSent();
++	EXPECT_EQ(command.state(), State::Sent);
++	EXPECT_TRUE(command.finished());
++	EXPECT_FALSE(command.update(1600000, true, true, true));
++}
++
++TEST(DShotTurtleCommand, MovingOutputsRestartStopWait)
++{
++	DShotTurtleCommand command;
++	command.start(1000000);
++	EXPECT_FALSE(command.update(1000000, true, true, true));
++	EXPECT_FALSE(command.update(1400000, true, true, false));
++	EXPECT_FALSE(command.update(1500000, true, true, true));
++	EXPECT_FALSE(command.update(1999999, true, true, true));
++	EXPECT_TRUE(command.update(2000000, true, true, true));
++}
++
++TEST(DShotTurtleCommand, ArmingOrInvalidModeAborts)
++{
++	DShotTurtleCommand command;
++	command.start(1000000);
++	EXPECT_FALSE(command.update(1000000, false, true, true));
++	EXPECT_EQ(command.state(), State::Aborted);
++	EXPECT_FALSE(command.update(2000000, true, true, true));
++}
++
++TEST(DShotTurtleCommand, InvalidOrChangedTargetAborts)
++{
++	DShotTurtleCommand command;
++	command.start(1000000);
++	EXPECT_FALSE(command.update(1000000, true, false, true));
++	EXPECT_EQ(command.state(), State::Aborted);
++	command.start(2000000);
++	command.update(2000000, true, true, true);
++	ASSERT_TRUE(command.update(2500000, true, true, true));
++	command.frameSent();
++	EXPECT_FALSE(command.update(2510000, true, false, true));
++	EXPECT_EQ(command.state(), State::Aborted);
++}
++
++TEST(DShotTurtleCommand, ThrottleDuringSendingAborts)
++{
++	DShotTurtleCommand command;
++	command.start(1000000);
++	command.update(1000000, true, true, true);
++	ASSERT_TRUE(command.update(1500000, true, true, true));
++	EXPECT_FALSE(command.update(1510000, true, true, false));
++	EXPECT_EQ(command.state(), State::Aborted);
++}
++
++TEST(DShotTurtleCommand, TimeoutsAndFreshRequest)
++{
++	DShotTurtleCommand command;
++	command.start(1000000);
++	EXPECT_FALSE(command.update(4000000, true, true, true));
++	EXPECT_EQ(command.state(), State::TimedOut);
++	command.start(5000000);
++	EXPECT_FALSE(command.update(5000000, true, true, true));
++	EXPECT_TRUE(command.update(5500000, true, true, true));
++	EXPECT_EQ(command.state(), State::Sending);
++}
++
++TEST(DShotTurtleCommand, InactiveAndInvalidTimeCannotSend)
++{
++	DShotTurtleCommand command;
++	EXPECT_FALSE(command.update(1000000, true, true, true));
++	command.start(1000000);
++	EXPECT_FALSE(command.update(999999, true, true, true));
++	EXPECT_EQ(command.state(), State::Aborted);
++}
+diff --git a/src/lib/turtle_recovery/TurtleFlipController.hpp b/src/lib/turtle_recovery/TurtleFlipController.hpp
+new file mode 100644
+index 0000000000..cd1b57b472
+--- /dev/null
++++ b/src/lib/turtle_recovery/TurtleFlipController.hpp
+@@ -0,0 +1,198 @@
++// SPDX-License-Identifier: BSD-3-Clause[TurtleFlipController.hpp](/home/luo/PX4-Autopilot/src/lib/turtle_recovery/TurtleFlipController.hpp)
++//翻身状态机：确认、准备、出力、收油、成功与失败
++// Copyright (c) 2026 PX4 Development Team. All rights reserved.
++#pragma once
++#include "TurtleProtocol.hpp"
++#include <cmath>
++
++namespace turtle_recovery
++{
++class TurtleFlipController
++{
++public:
++	enum class State { Idle, Qualify, Prepare, Drive, Coast, Cleanup, Done, Failed };
++	struct Input {
++		uint64_t now{0};
++		bool enabled{false}, safe{false}, low{false}, high{false}, entry{false};
++		bool feedback_fresh{false}, backend_idle{false}, backend_ready{false}, backend_clean{false};
++		uint64_t backend_session{0};
++		float tilt{0.f}, phase{0.f}, roll_rate{0.f}, gyro_norm{0.f}; // degrees except phase (rad)
++	};
++	struct Settings {
++		float max_throttle{0.12f}, target_rate{120.f}, release_tilt{75.f};
++		float no_progress_timeout{1.2f}, drive_timeout{2.5f}; // seconds from Drive entry, including ramp
++		float throttle_slew{0.25f}; // normalized throttle increase per second at zero roll rate
++	};
++
++	static bool validTiming(const Settings &settings)
++	{
++		return std::isfinite(settings.no_progress_timeout) && std::isfinite(settings.drive_timeout)
++		       && settings.no_progress_timeout >= 0.5f && settings.no_progress_timeout <= 2.5f
++		       && settings.drive_timeout >= 0.5f && settings.drive_timeout <= 2.8f
++		       && settings.no_progress_timeout <= settings.drive_timeout;
++	}
++
++	static bool validSlew(const Settings &settings)
++	{
++		return std::isfinite(settings.throttle_slew) && settings.throttle_slew >= 0.1f && settings.throttle_slew <= 1.f;
++	}
++
++	Request update(const Input &in, const Settings &settings)
++	{
++		const float dt = _last_now != 0 && in.now >= _last_now ? fminf(0.05f, (in.now - _last_now) * 1e-6f) : 0.f;
++		_last_now = in.now;
++		const bool inactive = _state == State::Idle || _state == State::Done || _state == State::Failed;
++		const bool timing_valid = validTiming(settings);
++		const bool settings_valid = timing_valid && validSlew(settings);
++		const char *invalid_settings_reason = !timing_valid ? "invalid recovery time settings" : "invalid recovery throttle slew";
++
++		if (!in.safe || !in.enabled || !settings_valid) { _off_seen = false; }
++
++		if (inactive) {
++			if (!settings_valid) { _reason = invalid_settings_reason; }
++
++			if (in.safe && settings_valid && in.low) {
++				_off_seen = true;
++				_state = State::Idle;
++				_session = 0;
++				_progress = 0.f;
++				_reason = "waiting for RC HIGH";
++			}
++
++			if (in.enabled && in.safe && settings_valid && in.high && _off_seen) {
++				_off_seen = false;
++
++				if (in.entry && in.feedback_fresh && in.backend_idle && in.backend_clean) {
++					_state = State::Qualify;
++					_started = in.now;
++					_reason = "qualifying inverted rest";
++
++				} else {
++					_state = State::Failed;
++					_reason = "entry rejected: require inverted rest and clean backend";
++				}
++			}
++
++			return request(in.now);
++		}
++
++		if (_state != State::Cleanup && (!settings_valid || !in.enabled || !in.safe || !in.high || !in.feedback_fresh)) {
++			fail(!settings_valid ? invalid_settings_reason : "disabled, RC/attitude lost, switch off or arming");
++		}
++
++		if (_state == State::Qualify) {
++			if (!in.entry || !in.backend_idle || !in.backend_clean) {
++				_state = State::Failed;
++				_reason = "inverted rest interrupted";
++
++			} else if (in.now - _started >= 500000) {
++				_session = in.now;
++				_state = State::Prepare;
++				_started = in.now;
++				_reason = "reversing Motor 1 and Motor 4";
++			}
++
++		} else if (_state == State::Prepare) {
++			if (!in.entry) {
++				fail("inverted rest interrupted before drive");
++
++			} else if (in.backend_session == _session && in.backend_ready) {
++				_state = State::Drive;
++				_started = in.now;
++				_last_phase = in.phase;
++				_progress = 0.f;
++				_throttle = 0.f;
++				_reason = "fixed positive roll";
++
++			} else if (in.now - _started > 3000000) { fail("reverse preparation timeout"); }
++
++		} else if (_state == State::Drive) {
++			float delta = in.phase - _last_phase;
++
++			while (delta > 3.14159265f) { delta -= 6.28318531f; }
++
++			while (delta < -3.14159265f) { delta += 6.28318531f; }
++
++			_progress += delta * 57.2957795f;
++			_last_phase = in.phase;
++
++			if (!std::isfinite(_progress) || !std::isfinite(in.roll_rate) || _progress < -10.f || in.roll_rate < -30.f) {
++				fail("wrong roll direction");
++
++			} else if (in.now - _started >= durationUs(settings.drive_timeout)) {
++				fail("drive timeout");
++
++			} else if (in.now - _started >= durationUs(settings.no_progress_timeout) && _progress < 5.f) {
++				fail("no roll progress");
++
++			} else if (!in.backend_ready || in.backend_session != _session) {
++				fail("backend stopped drive");
++
++			} else if (in.tilt <= settings.release_tilt || in.roll_rate >= 250.f
++				   || (_progress >= 60.f && in.tilt - fmaxf(0.f, in.roll_rate) * 0.15f <= settings.release_tilt)) {
++				_state = State::Coast;
++				_started = in.now;
++				_settled_since = 0;
++				_throttle = 0.f;
++				_reason = "coasting and restoring direction";
++
++			} else {
++				const float rate = fmaxf(30.f, settings.target_rate);
++				const float change = in.roll_rate > rate ? -0.5f : settings.throttle_slew * (1.f - fmaxf(0.f, in.roll_rate) / rate);
++				_throttle = fmaxf(0.f, fminf(fminf(settings.max_throttle, HARD_MAX_THROTTLE), _throttle + change * dt));
++			}
++
++		} else if (_state == State::Coast) {
++			if (in.tilt < 25.f && in.gyro_norm < 10.f) {
++				if (_settled_since == 0) { _settled_since = in.now; }
++
++			} else { _settled_since = 0; }
++
++			if (_settled_since != 0 && in.now - _settled_since >= 500000 && restored(in)) {
++				_state = State::Done;
++				_reason = "upright, stopped and direction restored";
++
++			} else if (in.now - _started > 4000000) { fail("did not settle upright"); }
++
++		} else if (_state == State::Cleanup && restored(in)) {
++			_state = State::Failed;
++		}
++
++		return request(in.now);
++	}
++
++	void fail(const char *reason) { _state = State::Cleanup; _throttle = 0.f; _reason = reason; }
++	bool active() const { return _state != State::Idle && _state != State::Done && _state != State::Failed; }
++	State state() const { return _state; }
++	const char *reason() const { return _reason; }
++	float progress() const { return _progress; }
++	float throttle() const { return _throttle; }
++	uint64_t session() const { return _session; }
++	Request request(uint64_t now) const
++	{
++		Request result{};
++		result.timestamp = now;
++		result.session = _session;
++		result.action = _state == State::Prepare ? Action::Prepare : (_state == State::Drive ? Action::Drive : Action::Stop);
++		result.throttle = _state == State::Drive ? _throttle : 0.f;
++		return result;
++	}
++
++private:
++	static uint64_t durationUs(float seconds)
++	{
++		// Only called after validTiming(). Round float seconds to integer microseconds.
++		return static_cast<uint64_t>(static_cast<double>(seconds) * 1000000.0 + 0.5);
++	}
++
++	bool restored(const Input &in) const
++	{
++		return in.feedback_fresh && in.backend_idle && in.backend_clean && (_session == 0 || in.backend_session == _session);
++	}
++	State _state{State::Idle};
++	bool _off_seen{false};
++	uint64_t _session{0}, _started{0}, _last_now{0}, _settled_since{0};
++	float _last_phase{0.f}, _progress{0.f}, _throttle{0.f};
++	const char *_reason{"waiting for RC LOW then HIGH"};
++};
++} // namespace turtle_recovery
+diff --git a/src/lib/turtle_recovery/TurtleOutputGuard.hpp b/src/lib/turtle_recovery/TurtleOutputGuard.hpp
+new file mode 100644
+index 0000000000..5037450d60
+--- /dev/null
++++ b/src/lib/turtle_recovery/TurtleOutputGuard.hpp
+@@ -0,0 +1,131 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//驱动状态机：停机等待、反转、限幅、超时、恢复保存转向
++// Copyright (c) 2026 PX4 Development Team. All rights reserved.
++#pragma once
++#include "TurtleProtocol.hpp"
++#include <cmath>
++
++namespace turtle_recovery
++{
++// Runs in the DShot worker. Loss of the controller always stops thrust and
++// restores direction locally; no controller heartbeat is needed for cleanup.
++class TurtleOutputGuard
++{
++public:
++	void restore(uint64_t now, uint16_t mask)
++	{
++		_session = 0; // startup/reenable restore covers all mapped motors
++		_result = 0;
++		_mask = mask;
++		_dirty = true; // conservative: direction unknown after a controller reboot
++		_state = OutputState::StopRestore;
++		_stopped_since = 0;
++		_last_now = now;
++	}
++
++	OutputFrame update(uint64_t now, const Request &request, const OutputPermission &p)
++	{
++		const bool fresh = request.timestamp != 0 && now >= request.timestamp && now - request.timestamp < LEASE_US;
++
++		if (_state == OutputState::Idle) {
++			if (!fresh || request.session == 0 || request.session == _session || request.action != Action::Prepare
++			    || !p.enabled || !p.stop_safe || !p.live || !p.entry || !p.normal_outputs_stopped || p.right_mask == 0) {
++				return {};
++			}
++
++			_session = request.session;
++			_mask = p.right_mask;
++			_state = OutputState::StopReverse;
++			_stopped_since = 0;
++			_result = 0;
++		}
++
++		const bool restoring = _state == OutputState::StopRestore || _state == OutputState::Restoring;
++
++		if (!restoring) {
++			const bool abort = !fresh || request.session != _session || request.action == Action::Stop
++					   || !p.enabled || !p.stop_safe || !p.live || !p.normal_outputs_stopped
++					   || p.right_mask != _mask || now < _last_now;
++
++			if (abort || (_state == OutputState::Driving && now - _drive_start >= 3000000)) {
++				_result = (fresh && request.session == _session && request.action == Action::Stop) ? 0 : 1;
++				_state = OutputState::StopRestore;
++				_stopped_since = 0;
++			}
++		}
++
++		_last_now = now;
++		OutputFrame frame{FrameKind::Stop, _mask, 0.f};
++
++		if (_state == OutputState::StopReverse || _state == OutputState::StopRestore) {
++			if (!p.stop_safe || (_mask & p.available_mask) != _mask) {
++				_stopped_since = 0;
++				return frame;
++			}
++
++			if (_stopped_since == 0) { _stopped_since = now; }
++
++			if (now - _stopped_since < 500000) { return frame; }
++
++			_state = _state == OutputState::StopReverse ? OutputState::Reversing : OutputState::Restoring;
++			_remaining = 10;
++		}
++
++		if (_state == OutputState::Reversing || _state == OutputState::Restoring) {
++			if (!p.stop_safe || (_mask & p.available_mask) != _mask) { return frame; }
++
++			frame.kind = _state == OutputState::Reversing ? FrameKind::Reverse : FrameKind::Restore;
++			return frame;
++		}
++
++		if (_state == OutputState::Ready && request.action == Action::Drive) {
++			_state = OutputState::Driving;
++			_drive_start = now;
++		}
++
++		if (_state == OutputState::Driving) {
++			if (request.action != Action::Drive || !std::isfinite(request.throttle) || request.throttle < 0.f
++			    || !std::isfinite(p.throttle_limit) || p.throttle_limit <= 0.f) {
++				_state = OutputState::StopRestore;
++				_stopped_since = 0;
++				_result = 1;
++				return frame;
++			}
++
++			frame.kind = FrameKind::Throttle;
++			frame.throttle = fminf(request.throttle, fminf(p.throttle_limit, HARD_MAX_THROTTLE));
++		}
++
++		return frame;
++	}
++
++	void frameSent(FrameKind kind)
++	{
++		if (_state == OutputState::Reversing && kind == FrameKind::Reverse) {
++			_dirty = true; // even an interrupted burst may have reached an ESC
++
++			if (--_remaining == 0) { _state = OutputState::Ready; }
++
++		} else if (_state == OutputState::Restoring && kind == FrameKind::Restore) {
++			if (--_remaining == 0) {
++				_dirty = false;
++				_state = OutputState::Idle;
++			}
++		}
++	}
++
++	bool busy() const { return _state != OutputState::Idle; }
++	bool dirty() const { return _dirty; }
++	uint64_t session() const { return _session; }
++	OutputState state() const { return _state; }
++	uint8_t result() const { return _result; }
++	uint16_t mask() const { return _mask; }
++private:
++	OutputState _state{OutputState::Idle};
++	uint64_t _session{0}, _last_now{0}, _stopped_since{0}, _drive_start{0};
++	uint16_t _mask{0};
++	unsigned _remaining{0};
++	bool _dirty{false};
++	uint8_t _result{0};
++};
++} // namespace turtle_recovery
+diff --git a/src/lib/turtle_recovery/TurtleProtocol.hpp b/src/lib/turtle_recovery/TurtleProtocol.hpp
+new file mode 100644
+index 0000000000..29560b1940
+--- /dev/null
++++ b/src/lib/turtle_recovery/TurtleProtocol.hpp
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: BSD-3-Clause
++//共享状态、请求结构、电机掩码、油门硬上限
++// Copyright (c) 2026 PX4 Development Team. All rights reserved.
++#pragma once
++#include <cstdint>
++
++namespace turtle_recovery
++{
++static constexpr uint16_t RIGHT_MOTORS = 0x9; // logical Motor 1 and Motor 4
++static constexpr uint16_t ALL_MOTORS = 0xf;
++static constexpr uint64_t LEASE_US = 200000;
++static constexpr float HARD_MAX_THROTTLE = 0.8f;
++enum class Action : uint8_t { Stop = 0, Prepare = 1, Drive = 2 };
++enum class OutputState : uint8_t { Idle, StopReverse, Reversing, Ready, Driving, StopRestore, Restoring };
++enum class FrameKind { None, Stop, Reverse, Throttle, Restore };
++struct Request {
++	uint64_t timestamp{0};
++	uint64_t session{0};
++	Action action{Action::Stop};
++	float throttle{0.f};
++};
++struct OutputPermission {
++	bool enabled{false};
++	bool stop_safe{false}; // disarmed, no kill/lockdown/termination/calibration
++	bool live{false};      // fresh RC HIGH, low throttle, valid attitude and gyro
++	bool entry{false};     // also inverted, landed and stationary
++	bool normal_outputs_stopped{false};
++	uint16_t right_mask{0}; // physical DShot pins resolved from Motor functions
++	uint16_t available_mask{0};
++	float throttle_limit{0.f};
++};
++struct OutputFrame {
++	FrameKind kind{FrameKind::None};
++	uint16_t mask{0};
++	float throttle{0.f};
++};
++} // namespace turtle_recovery
+diff --git a/src/modules/commander/Commander.cpp b/src/modules/commander/Commander.cpp
+index 663223c9bf..f356f29a59 100644
+--- a/src/modules/commander/Commander.cpp
++++ b/src/modules/commander/Commander.cpp
+@@ -552,6 +552,33 @@ transition_result_t Commander::arm(arm_disarm_reason_t calling_reason, bool run_
+ 		return TRANSITION_NOT_CHANGED;
+ 	}
+ 
++	// Recovery does not spoof normal arming. Keep the normal arming path closed
++	// from the first leased request until the ESC directions have been restored.
++	turtle_recovery_feedback_s turtle_feedback{};
++	turtle_recovery_control_s turtle_control{};
++	const uint64_t turtle_now = hrt_absolute_time();
++	const bool have_feedback = _turtle_feedback_sub.copy(&turtle_feedback);
++	const bool feedback_fresh = have_feedback && turtle_feedback.timestamp != 0
++				    && turtle_now >= turtle_feedback.timestamp && turtle_now - turtle_feedback.timestamp < 200000;
++
++	if (have_feedback && (turtle_feedback.busy || turtle_feedback.direction_dirty)) { _turtle_arming_inhibit = true; }
++
++	if (feedback_fresh && !turtle_feedback.busy && !turtle_feedback.direction_dirty) { _turtle_arming_inhibit = false; }
++
++	const bool pending_turtle = _turtle_control_sub.copy(&turtle_control) && turtle_control.timestamp != 0
++				    && turtle_now >= turtle_control.timestamp && turtle_now - turtle_control.timestamp < 200000
++				    && turtle_control.action != turtle_recovery_control_s::ACTION_STOP;
++	int32_t turtle_enabled = 0;
++	param_get(param_find("TRTL_ENABLE"), &turtle_enabled);
++
++	if (_turtle_arming_inhibit || pending_turtle || (turtle_enabled != 0 && !feedback_fresh)) {
++		mavlink_log_critical(&_mavlink_log_pub, "Arming denied: turtle recovery or direction restore pending\t");
++		events::send(events::ID("commander_arm_denied_turtle"), {events::Log::Critical, events::LogInternal::Info},
++			     "Arming denied: turtle recovery or direction restore pending");
++		tune_negative(true);
++		return TRANSITION_DENIED;
++	}
++
+ 	if (_vehicle_status.calibration_enabled
+ 	    || _vehicle_status.rc_calibration_in_progress
+ 	    || _actuator_armed.in_esc_calibration_mode) {
+diff --git a/src/modules/commander/Commander.hpp b/src/modules/commander/Commander.hpp
+index e079d13ee8..8706b8da7a 100644
+--- a/src/modules/commander/Commander.hpp
++++ b/src/modules/commander/Commander.hpp
+@@ -70,6 +70,8 @@
+ #include <uORB/topics/distance_sensor.h>
+ #include <uORB/topics/iridiumsbd_status.h>
+ #include <uORB/topics/manual_control_setpoint.h>
++#include <uORB/topics/turtle_recovery_feedback.h>
++#include <uORB/topics/turtle_recovery_control.h>
+ #include <uORB/topics/mission_result.h>
+ #include <uORB/topics/offboard_control_mode.h>
+ #include <uORB/topics/parameter_update.h>
+@@ -280,6 +282,7 @@ private:
+ 	bool _have_taken_off_since_arming{false};
+ 	bool _status_changed{true};
+ 	bool _mission_in_progress{false};
++	bool _turtle_arming_inhibit{false};
+ 
+ 	vehicle_land_detected_s	_vehicle_land_detected{};
+ 
+@@ -293,6 +296,8 @@ private:
+ 	uORB::Subscription					_cpuload_sub{ORB_ID(cpuload)};
+ 	uORB::Subscription					_iridiumsbd_status_sub{ORB_ID(iridiumsbd_status)};
+ 	uORB::Subscription					_manual_control_setpoint_sub{ORB_ID(manual_control_setpoint)};
++	uORB::Subscription _turtle_feedback_sub{ORB_ID(turtle_recovery_feedback)};
++	uORB::Subscription _turtle_control_sub{ORB_ID(turtle_recovery_control)};
+ 	uORB::Subscription					_system_power_sub{ORB_ID(system_power)};
+ 	uORB::Subscription					_vehicle_command_sub{ORB_ID(vehicle_command)};
+ 	uORB::Subscription					_vehicle_command_mode_executor_sub{ORB_ID(vehicle_command_mode_executor)};
+diff --git a/src/modules/turtle_recovery/CMakeLists.txt b/src/modules/turtle_recovery/CMakeLists.txt
+new file mode 100644
+index 0000000000..2b5cd43afa
+--- /dev/null
++++ b/src/modules/turtle_recovery/CMakeLists.txt
+@@ -0,0 +1,45 @@
++############################################################################
++#
++# Copyright (c) 2026 PX4 Development Team. All rights reserved.
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions
++# are met:
++#
++# 1. Redistributions of source code must retain the above copyright
++#    notice, this list of conditions and the following disclaimer.
++# 2. Redistributions in binary form must reproduce the above copyright
++#    notice, this list of conditions and the following disclaimer in
++#    the documentation and/or other materials provided with the
++#    distribution.
++# 3. Neither the name PX4 nor the names of its contributors may be
++#    used to endorse or promote products derived from this software
++#    without specific prior written permission.
++#
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++# OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++# AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++# POSSIBILITY OF SUCH DAMAGE.
++#
++############################################################################
++
++px4_add_module(
++	MODULE modules__turtle_recovery
++	MAIN turtle_recovery
++	SRCS
++		TurtleRecovery.cpp
++		TurtleObserver.hpp
++	DEPENDS
++		px4_work_queue
++)
++
++px4_add_unit_gtest(SRC TurtleObserverTest.cpp)
++px4_add_unit_gtest(SRC TurtleRecoveryTest.cpp)
+diff --git a/src/modules/turtle_recovery/Kconfig b/src/modules/turtle_recovery/Kconfig
+new file mode 100644
+index 0000000000..70c1d33c79
+--- /dev/null
++++ b/src/modules/turtle_recovery/Kconfig
+@@ -0,0 +1,7 @@
++menuconfig MODULES_TURTLE_RECOVERY
++	bool "turtle_recovery"
++	default n
++	---help---
++		Observe RC input, attitude and motor geometry for turtle recovery.
++		TRTL_ENABLE additionally enables automatic positive-roll recovery
++		using disarmed Motor 1 and Motor 4 through the guarded DShot backend.
+diff --git a/src/modules/turtle_recovery/TurtleObserver.hpp b/src/modules/turtle_recovery/TurtleObserver.hpp
+new file mode 100644
+index 0000000000..ebc4da8971
+--- /dev/null
++++ b/src/modules/turtle_recovery/TurtleObserver.hpp
+@@ -0,0 +1,150 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++//倒扣判断、开关识别、遥控时效、右侧电机识别
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <matrix/matrix/math.hpp>
++// 将这些函数和类放进专属命名空间，避免与其他模块同名冲突
++namespace turtle_recovery
++{
++enum class SwitchPosition { Unknown, Low, Middle, High };
++
++// 当前开关位置直接由 AUX 数值决定，不依赖是否曾经经过 OFF。
++inline SwitchPosition switchPosition(bool valid, float aux)
++{
++	if (!valid || !std::isfinite(aux) || fabsf(aux) > 1.f) {
++		return SwitchPosition::Unknown;
++	}
++
++	if (aux > 0.5f) {
++		return SwitchPosition::High;
++	}
++
++	return aux < -0.5f ? SwitchPosition::Low : SwitchPosition::Middle;
++}
++
++// rc_update 在通道值不变时可能超过 300 ms 才更新，沿用 PX4 的失联超时。
++inline bool rcSampleFresh(uint64_t now, uint64_t timestamp_sample, float timeout_s)
++{
++	return timestamp_sample != 0 && now >= timestamp_sample
++	       && std::isfinite(timeout_s) && timeout_s > 0.f
++	       && now - timestamp_sample < static_cast<double>(timeout_s) * 1e6;
++}
++
++// 判断机体 +Z 轴与地球向下方向的对齐程度，返回 true 表示四元数有效.
++
++
++// Alignment of body +Z with earth down. No Euler angle conversion is needed.
++inline bool attitudeAlignment(const float q[4], float &alignment)  //根据四元数判断机体倾斜程度
++{//输入是姿态四元数 q，输出是 alignment，函数返回值表示输入姿态是否有效。
++	alignment = NAN;
++	matrix::Quatf attitude{q};//构造四元数对象
++	const float norm = attitude.norm();//模长
++
++	if (!std::isfinite(norm) || fabsf(norm - 1.f) > 0.02f) {
++		return false;
++	}//如果模长不是有限数，或与单位四元数的模长 1.0 相差超过 0.02，就返回 false。
++
++	attitude.normalize(); //将四元数归一化，转换为方向余弦矩阵。
++	alignment = matrix::Dcmf{attitude}(2, 2); //读取矩阵的 (2, 2) 元素，作为机体 +Z 轴与地球向下方向的对齐程度，返回 true
++	return true;
++}//用矩阵元素而不是欧拉角，能避免万向届思索
++
++
++// Logical motor indices, not physical output channels. Only a conventional
++// four-rotor layout with two motors on either side is supported in this stage.
++inline bool rightMotorMask(const float position_y[4], uint32_t &mask)
++{//position_y > 0 表示右侧电机，position_y < 0 表示左侧电机，mask 是输出的位掩码，表示右侧电机的索引。
++	mask = 0;
++	unsigned right_count = 0;
++	unsigned left_count = 0;
++
++	for (unsigned i = 0; i < 4; ++i) {
++		if (!std::isfinite(position_y[i]) || fabsf(position_y[i]) < 1e-4f) {
++			mask = 0;
++			return false;
++		}
++
++		if (position_y[i] > 0.f) {
++			mask |= 1u << i;
++			++right_count;
++
++		} else {
++			++left_count;
++		}
++	}
++
++	if (right_count != 2 || left_count != 2) {
++		mask = 0;
++		return false;
++	}
++
++	return true;
++}
++
++//检测辅助开关的 OFF→ON 触发
++class ObserveTrigger
++{
++public:   //available：当前输入能不能信，aux：当前输入的开关
++	bool update(bool available, float aux)
++	{
++		if (!available || !std::isfinite(aux) || aux < -1.f || aux > 1.f) {
++			reset();
++			return false;
++		}
++
++		if (aux < -0.5f) {
++			_seen_off = true;
++			_active = false;
++
++		} else if (aux > 0.5f && _seen_off && !_active) {
++			_active = true;
++			return true;
++		}
++
++		return false;
++	}
++//reset()：把状态清零。_seen_off = false 表示还没观察到开关处于 OFF；
++//_active = false 表示当前未激活。开关输入失效时，update() 会调用它。
++	void reset() { _seen_off = false; _active = false; }
++	bool active() const { return _active; }
++	bool seenOff() const { return _seen_off; }
++
++private:
++	bool _seen_off{false};
++	bool _active{false};
++};
++
++} // namespace turtle_recovery
+diff --git a/src/modules/turtle_recovery/TurtleObserverTest.cpp b/src/modules/turtle_recovery/TurtleObserverTest.cpp
+new file mode 100644
+index 0000000000..b421264395
+--- /dev/null
++++ b/src/modules/turtle_recovery/TurtleObserverTest.cpp
+@@ -0,0 +1,177 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++//基础逻辑测试
++#include "TurtleObserver.hpp"
++#include <gtest/gtest.h>
++
++using namespace turtle_recovery;
++
++TEST(TurtleObserver, SwitchPositionUsesCurrentLevel)
++{
++	EXPECT_EQ(switchPosition(true, 1.f), SwitchPosition::High);
++	EXPECT_EQ(switchPosition(true, -1.f), SwitchPosition::Low);
++	EXPECT_EQ(switchPosition(true, 0.f), SwitchPosition::Middle);
++	EXPECT_EQ(switchPosition(true, 0.5f), SwitchPosition::Middle);
++	EXPECT_EQ(switchPosition(true, -0.5f), SwitchPosition::Middle);
++	EXPECT_EQ(switchPosition(false, 1.f), SwitchPosition::Unknown);
++	EXPECT_EQ(switchPosition(true, NAN), SwitchPosition::Unknown);
++	EXPECT_EQ(switchPosition(true, 2.f), SwitchPosition::Unknown);
++
++	ObserveTrigger trigger;
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	EXPECT_EQ(switchPosition(true, 1.f), SwitchPosition::High);
++}
++
++TEST(TurtleObserver, UnchangedRcRefreshDoesNotResetOnSwitch)
++{
++	ObserveTrigger trigger;
++	uint64_t sample = 1000000;
++	EXPECT_FALSE(trigger.update(rcSampleFresh(sample, sample, 0.5f), -1.f));
++	ASSERT_TRUE(trigger.update(rcSampleFresh(sample, sample, 0.5f), 1.f));
++
++	for (uint64_t now = sample + 20000; now < 3000000; now += 20000) {
++		if (now - sample >= 320000) {
++			sample = now;
++		}
++
++		ASSERT_TRUE(rcSampleFresh(now, sample, 0.5f));
++		EXPECT_FALSE(trigger.update(rcSampleFresh(now, sample, 0.5f), 1.f));
++		EXPECT_TRUE(trigger.active());
++		EXPECT_TRUE(trigger.seenOff());
++	}
++
++	EXPECT_FALSE(trigger.update(rcSampleFresh(sample + 500000, sample, 0.5f), 1.f));
++	EXPECT_FALSE(trigger.active());
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	EXPECT_FALSE(trigger.update(true, -1.f));
++	EXPECT_TRUE(trigger.update(true, 1.f));
++}
++
++TEST(TurtleObserver, RcFreshnessUsesSampleTimeAndConfiguredTimeout)
++{
++	EXPECT_TRUE(rcSampleFresh(1400000, 1000000, 0.5f));
++	EXPECT_FALSE(rcSampleFresh(1400000, 1000000, 0.3f));
++	EXPECT_FALSE(rcSampleFresh(1500000, 1000000, 0.5f));
++	EXPECT_FALSE(rcSampleFresh(1000000, 0, 0.5f));
++	EXPECT_FALSE(rcSampleFresh(1000000, 1000001, 0.5f));
++	EXPECT_FALSE(rcSampleFresh(1000000, 1000000, NAN));
++	EXPECT_FALSE(rcSampleFresh(1000000, 1000000, 0.f));
++}
++
++TEST(TurtleObserver, AttitudeAcrossFullRoll)
++{
++	for (int degrees = 0; degrees <= 360; ++degrees) {
++		const float angle = degrees * 0.017453292519943295f;
++		const float q[4] {cosf(angle / 2.f), sinf(angle / 2.f), 0.f, 0.f};
++		const float negative_q[4] {-q[0], -q[1], -q[2], -q[3]};
++		float alignment;
++		float negative_alignment;
++		ASSERT_TRUE(attitudeAlignment(q, alignment));
++		ASSERT_TRUE(attitudeAlignment(negative_q, negative_alignment));
++		EXPECT_NEAR(alignment, cosf(angle), 1e-5f);
++		EXPECT_FLOAT_EQ(alignment, negative_alignment);
++	}
++}
++
++TEST(TurtleObserver, PitchAtEulerSingularity)
++{
++	const float q[4] {sqrtf(0.5f), 0.f, sqrtf(0.5f), 0.f};
++	float alignment;
++	ASSERT_TRUE(attitudeAlignment(q, alignment));
++	EXPECT_NEAR(alignment, 0.f, 1e-5f);
++}
++
++TEST(TurtleObserver, InvalidAttitude)
++{
++	const float zero[4] {};
++	const float invalid[4] {NAN, 0.f, 0.f, 0.f};
++	const float scaled[4] {2.f, 0.f, 0.f, 0.f};
++	float alignment;
++	EXPECT_FALSE(attitudeAlignment(zero, alignment));
++	EXPECT_FALSE(attitudeAlignment(invalid, alignment));
++	EXPECT_FALSE(attitudeAlignment(scaled, alignment));
++	EXPECT_TRUE(std::isnan(alignment));
++}
++
++TEST(TurtleObserver, RightMotorsFollowGeometryInsteadOfMotorNumbers)
++{
++	const float px4_x[4] {1.f, -1.f, -1.f, 1.f};
++	const float remapped[4] {-1.f, 1.f, 1.f, -1.f};
++	const float plus[4] {0.f, -1.f, 1.f, 0.f};
++	const float invalid[4] {NAN, -1.f, -1.f, 1.f};
++	const float asymmetric[4] {1.f, 1.f, 1.f, -1.f};
++	uint32_t mask;
++	ASSERT_TRUE(rightMotorMask(px4_x, mask));
++	EXPECT_EQ(mask, 0x9u);
++	ASSERT_TRUE(rightMotorMask(remapped, mask));
++	EXPECT_EQ(mask, 0x6u);
++	EXPECT_FALSE(rightMotorMask(plus, mask));
++	EXPECT_EQ(mask, 0u);
++	EXPECT_FALSE(rightMotorMask(invalid, mask));
++	EXPECT_EQ(mask, 0u);
++	EXPECT_FALSE(rightMotorMask(asymmetric, mask));
++	EXPECT_EQ(mask, 0u);
++}
++
++TEST(TurtleObserver, StartsOnAndHeldOnDoNotRetrigger)
++{
++	ObserveTrigger trigger;
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	EXPECT_FALSE(trigger.active());
++	EXPECT_FALSE(trigger.update(true, -1.f));
++	EXPECT_TRUE(trigger.update(true, 1.f));
++	EXPECT_TRUE(trigger.active());
++
++	for (int i = 0; i < 100; ++i) {
++		EXPECT_FALSE(trigger.update(true, 1.f));
++	}
++
++	EXPECT_FALSE(trigger.update(true, -1.f));
++	EXPECT_FALSE(trigger.active());
++	EXPECT_TRUE(trigger.update(true, 1.f));
++}
++
++TEST(TurtleObserver, InvalidInputAndUnavailableRequireOffAgain)
++{
++	ObserveTrigger trigger;
++	trigger.update(true, -1.f);
++	ASSERT_TRUE(trigger.update(true, 1.f));
++	EXPECT_FALSE(trigger.update(false, 1.f));
++	EXPECT_FALSE(trigger.active());
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	trigger.update(true, -1.f);
++	EXPECT_FALSE(trigger.update(true, NAN));
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	trigger.update(true, -1.f);
++	EXPECT_TRUE(trigger.update(true, 1.f));
++}
+diff --git a/src/modules/turtle_recovery/TurtleRecovery.cpp b/src/modules/turtle_recovery/TurtleRecovery.cpp
+new file mode 100644
+index 0000000000..6ecd0053b6
+--- /dev/null
++++ b/src/modules/turtle_recovery/TurtleRecovery.cpp
+@@ -0,0 +1,409 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++//主程序：读取遥控、姿态、角速度，检查启动条件，发送恢复请求
++
++#include "TurtleObserver.hpp"
++#include <turtle_recovery/TurtleFlipController.hpp>
++
++#include <drivers/drv_hrt.h>
++#include <mathlib/mathlib.h>
++#include <parameters/param.h>
++#include <px4_platform_common/module.h>
++#include <px4_platform_common/module_params.h>
++#include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
++#include <uORB/Subscription.hpp>
++#include <uORB/SubscriptionInterval.hpp>
++#include <uORB/Publication.hpp>
++#include <uORB/topics/actuator_armed.h>
++#include <uORB/topics/turtle_recovery_control.h>
++#include <uORB/topics/turtle_recovery_feedback.h>
++#include <uORB/topics/manual_control_setpoint.h>
++#include <uORB/topics/parameter_update.h>
++#include <uORB/topics/vehicle_angular_velocity.h>
++#include <uORB/topics/vehicle_attitude.h>
++#include <uORB/topics/vehicle_land_detected.h>
++#include <uORB/topics/vehicle_status.h>
++
++using namespace time_literals;
++
++class TurtleRecovery : public ModuleBase<TurtleRecovery>, public ModuleParams, public px4::ScheduledWorkItem
++{
++public:
++	TurtleRecovery() : ModuleParams(nullptr), ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::lp_default)
++	{
++		updateGeometry();
++	}
++
++	static int task_spawn(int argc, char *argv[]);
++	static int custom_command(int argc, char *argv[]) { return print_usage("unknown command"); }
++	static int print_usage(const char *reason = nullptr);
++	int print_status() override;
++
++private:
++	void Run() override;
++	void updateGeometry();
++	void updateRecovery(hrt_abstime now);
++	void publishRecovery(const turtle_recovery::Request &request);
++	float auxInput() const;
++	static bool fresh(hrt_abstime now, hrt_abstime timestamp, hrt_abstime timeout)
++	{
++		return timestamp != 0 && now >= timestamp && now - timestamp <= timeout;
++	}
++
++	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
++	uORB::Subscription _manual_sub{ORB_ID(manual_control_setpoint)};
++	uORB::Subscription _attitude_sub{ORB_ID(vehicle_attitude)};
++	uORB::Subscription _angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
++	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
++	uORB::Subscription _land_sub{ORB_ID(vehicle_land_detected)};
++	uORB::Subscription _armed_sub{ORB_ID(actuator_armed)};
++	uORB::Subscription _feedback_sub{ORB_ID(turtle_recovery_feedback)};
++	uORB::Publication<turtle_recovery_control_s> _recovery_pub{ORB_ID(turtle_recovery_control)};
++	actuator_armed_s _armed{};
++	turtle_recovery_feedback_s _feedback{};
++	turtle_recovery::TurtleFlipController _controller;
++	bool _cancel_recovery{false};
++	bool _recovery_safe{false};
++	bool _recovery_entry{false};
++	bool _feedback_fresh{false};
++	uint8_t _recovery_quat_reset{0};
++
++	manual_control_setpoint_s _manual{};
++	vehicle_attitude_s _attitude{};
++	vehicle_angular_velocity_s _angular_velocity{};
++	vehicle_status_s _vehicle_status{};
++	vehicle_land_detected_s _land{};
++	turtle_recovery::ObserveTrigger _trigger;
++	turtle_recovery::SwitchPosition _switch_position{turtle_recovery::SwitchPosition::Unknown};
++	bool _observing{false};
++
++	uint32_t _right_motor_mask{0};
++	unsigned _trigger_count{0};
++	float _position_y[4] {};
++	float _aux{NAN};
++	float _alignment{NAN};
++	float _tilt_deg{NAN};
++	float _roll_rate_deg_s{NAN};
++	bool _geometry_valid{false};
++	bool _rc_valid{false};
++	bool _attitude_valid{false};
++	bool _gyro_valid{false};
++	bool _status_valid{false};
++	bool _land_valid{false};
++
++	DEFINE_PARAMETERS(
++		(ParamBool<px4::params::TRTL_OBS_EN>) _param_obs_en,
++		(ParamInt<px4::params::TRTL_AUX>) _param_aux,
++		(ParamFloat<px4::params::COM_RC_LOSS_T>) _param_rc_loss_t,
++		(ParamBool<px4::params::TRTL_ENABLE>) _param_enable,
++		(ParamFloat<px4::params::TRTL_MAX_THR>) _param_max_thr,
++		(ParamFloat<px4::params::TRTL_R_RATE>) _param_rate,
++		(ParamFloat<px4::params::TRTL_REL_ANG>) _param_release_angle,
++		(ParamFloat<px4::params::TRTL_NP_T>) _param_no_progress_time,
++		(ParamFloat<px4::params::TRTL_DRV_T>) _param_drive_time,
++		(ParamFloat<px4::params::TRTL_THR_SLEW>) _param_throttle_slew
++	)
++};
++
++void TurtleRecovery::updateGeometry()
++{
++	_geometry_valid = false;
++	_right_motor_mask = 0;
++	int32_t rotor_count = 0;
++
++	if (param_get(param_find("CA_ROTOR_COUNT"), &rotor_count) != PX4_OK || rotor_count != 4) {
++		return;
++	}
++
++	for (unsigned i = 0; i < 4; ++i) {
++		char name[17];
++		snprintf(name, sizeof(name), "CA_ROTOR%u_PY", i);
++
++		if (param_get(param_find(name), &_position_y[i]) != PX4_OK) {
++			return;
++		}
++	}
++
++	_geometry_valid = turtle_recovery::rightMotorMask(_position_y, _right_motor_mask);
++}
++
++float TurtleRecovery::auxInput() const
++{
++	switch (_param_aux.get()) {
++	case 1: return _manual.aux1;
++
++	case 2: return _manual.aux2;
++
++	case 3: return _manual.aux3;
++
++	case 4: return _manual.aux4;
++
++	case 5: return _manual.aux5;
++
++	case 6: return _manual.aux6;
++
++	default: return NAN;
++	}
++}
++
++void TurtleRecovery::Run()
++{
++	if (should_exit()) {
++		auto stop = _controller.request(hrt_absolute_time());
++		stop.action = turtle_recovery::Action::Stop;
++		stop.throttle = 0.f;
++		publishRecovery(stop);
++		ScheduleClear();
++		exit_and_cleanup();
++		return;
++	}
++
++	if (_parameter_update_sub.updated()) {
++		_cancel_recovery |= _controller.active();
++		parameter_update_s update;
++		_parameter_update_sub.copy(&update);
++		const bool previous_enable = _param_obs_en.get();
++		const int32_t previous_aux = _param_aux.get();
++		updateParams();
++		updateGeometry();
++
++		if (previous_enable != _param_obs_en.get() || previous_aux != _param_aux.get()) {
++			_trigger.reset();
++		}
++	}
++
++	_manual_sub.update(&_manual);
++	_attitude_sub.update(&_attitude);
++	_angular_velocity_sub.update(&_angular_velocity);
++	_vehicle_status_sub.update(&_vehicle_status);
++	_land_sub.update(&_land);
++	_armed_sub.update(&_armed);
++	_feedback_sub.update(&_feedback);
++
++	const hrt_abstime now = hrt_absolute_time();
++	_aux = auxInput();
++	_rc_valid = _manual.valid && _manual.data_source == manual_control_setpoint_s::SOURCE_RC
++		    && turtle_recovery::rcSampleFresh(now, _manual.timestamp_sample, _param_rc_loss_t.get())
++		    && PX4_ISFINITE(_aux) && fabsf(_aux) <= 1.f;
++	_switch_position = turtle_recovery::switchPosition(_rc_valid, _aux);
++	_status_valid = fresh(now, _vehicle_status.timestamp, 2_s);
++	_land_valid = fresh(now, _land.timestamp, 2_s);
++	_attitude_valid = fresh(now, _attitude.timestamp_sample, 100_ms)
++			  && turtle_recovery::attitudeAlignment(_attitude.q, _alignment);
++	_tilt_deg = _attitude_valid ? math::degrees(acosf(math::constrain(_alignment, -1.f, 1.f))) : NAN;
++
++	if (!_attitude_valid) {
++		_alignment = NAN;
++	}
++
++	_gyro_valid = fresh(now, _angular_velocity.timestamp_sample, 100_ms)
++		      && matrix::Vector3f{_angular_velocity.xyz}.isAllFinite();
++	_roll_rate_deg_s = _gyro_valid ? math::degrees(_angular_velocity.xyz[0]) : NAN;
++
++	const bool switch_available = _param_obs_en.get() && _rc_valid && _status_valid
++				      && _vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_DISARMED;
++	_observing = switch_available && _switch_position == turtle_recovery::SwitchPosition::High;
++
++	if (_trigger.update(switch_available, _aux)) {
++		++_trigger_count;
++		PX4_INFO("RC request #%u: tilt %.1f deg, right mask 0x%x",
++			 _trigger_count, (double)_tilt_deg, (unsigned)_right_motor_mask);
++	}
++
++	updateRecovery(now);
++}
++
++void TurtleRecovery::publishRecovery(const turtle_recovery::Request &request)
++{
++	turtle_recovery_control_s message{};
++	message.timestamp = request.timestamp;
++	message.session_id = request.session;
++	message.action = static_cast<uint8_t>(request.action);
++	message.throttle = request.throttle;
++	_recovery_pub.publish(message);
++}
++
++void TurtleRecovery::updateRecovery(hrt_abstime now)
++{
++	using Controller = turtle_recovery::TurtleFlipController;
++	Controller::Settings settings{};
++	settings.max_throttle = _param_max_thr.get();
++	settings.target_rate = _param_rate.get();
++	settings.release_tilt = _param_release_angle.get();
++	settings.no_progress_timeout = _param_no_progress_time.get();
++	settings.drive_timeout = _param_drive_time.get();
++	settings.throttle_slew = _param_throttle_slew.get();
++	Controller::Input in{};
++	in.now = now;
++	in.enabled = _param_enable.get();
++	in.low = _rc_valid && _switch_position == turtle_recovery::SwitchPosition::Low;
++	in.high = _rc_valid && _switch_position == turtle_recovery::SwitchPosition::High;
++	const bool reset_unchanged = !_controller.active() || _recovery_quat_reset == _attitude.quat_reset_counter;
++	const bool settings_valid = PX4_ISFINITE(_param_max_thr.get()) && _param_max_thr.get() >= 0.05f
++				    && _param_max_thr.get() <= turtle_recovery::HARD_MAX_THROTTLE
++				    && PX4_ISFINITE(_param_rate.get()) && _param_rate.get() >= 30.f
++				    && _param_rate.get() <= 200.f && PX4_ISFINITE(_param_release_angle.get())
++				    && _param_release_angle.get() >= 30.f && _param_release_angle.get() <= 90.f
++				    && Controller::validTiming(settings) && Controller::validSlew(settings);
++	in.safe = _rc_valid && _status_valid && _attitude_valid && _gyro_valid && fresh(now, _armed.timestamp, 2_s)
++		  && !_armed.armed && !_armed.kill && !_armed.lockdown && !_armed.termination && !_armed.in_esc_calibration_mode
++		  && PX4_ISFINITE(_manual.throttle) && _manual.throttle < -0.8f && reset_unchanged && !_cancel_recovery
++		  && (!_vehicle_status.safety_button_available || _vehicle_status.safety_off)
++		  && _vehicle_status.power_input_valid && !_vehicle_status.calibration_enabled && !_vehicle_status.rc_calibration_in_progress
++		  && !_vehicle_status.failsafe && (_vehicle_status.failure_detector_status & ~3u) == 0 && settings_valid;
++	_cancel_recovery = false;
++	const matrix::Dcmf rotation{matrix::Quatf{_attitude.q}};
++	in.tilt = _tilt_deg;
++	in.phase = atan2f(rotation(2, 1), rotation(2, 2));
++	in.roll_rate = _roll_rate_deg_s;
++	in.gyro_norm = math::degrees(matrix::Vector3f{_angular_velocity.xyz}.norm());
++	in.safe &= PX4_ISFINITE(in.gyro_norm) && in.gyro_norm < 400.f && fabsf(rotation(2, 0)) < 0.5f;
++	in.entry = in.safe && _geometry_valid && _right_motor_mask == turtle_recovery::RIGHT_MOTORS
++		   && _land_valid && _land.landed && _tilt_deg > 150.f && in.gyro_norm < 10.f && fabsf(rotation(2, 0)) < 0.35f;
++	in.feedback_fresh = fresh(now, _feedback.timestamp, 200_ms);
++	in.backend_idle = _feedback.state == turtle_recovery_feedback_s::STATE_IDLE && !_feedback.busy;
++	in.backend_clean = !_feedback.direction_dirty;
++	in.backend_ready = _feedback.state == turtle_recovery_feedback_s::STATE_READY
++			   || _feedback.state == turtle_recovery_feedback_s::STATE_DRIVING;
++	in.backend_session = _feedback.session_id;
++	_recovery_safe = in.safe;
++	_recovery_entry = in.entry;
++	_feedback_fresh = in.feedback_fresh;
++	const auto previous_state = _controller.state();
++	const auto request = _controller.update(in, settings);
++
++	if (previous_state != _controller.state()) {
++		PX4_INFO("Recovery state %u: %s", static_cast<unsigned>(_controller.state()), _controller.reason());
++	}
++
++	if (!_controller.active()) { _recovery_quat_reset = _attitude.quat_reset_counter; }
++
++	publishRecovery(request);
++}
++
++int TurtleRecovery::print_status()
++{
++	PX4_INFO("Powered recovery: %s, state %u: %s", _param_enable.get() ? "ENABLED" : "disabled",
++		 static_cast<unsigned>(_controller.state()), _controller.reason());
++	PX4_INFO("Recovery progress %.1f deg, throttle %.3f (limit %.3f), backend state %u, busy %s, direction dirty %s",
++		 (double)_controller.progress(), (double)_controller.throttle(), (double)_param_max_thr.get(),
++		 _feedback.state, _feedback.busy ? "yes" : "no", _feedback.direction_dirty ? "yes" : "no");
++	PX4_INFO("Recovery checks: safe %s, inverted rest %s, feedback fresh %s",
++		 _recovery_safe ? "yes" : "no", _recovery_entry ? "yes" : "no", _feedback_fresh ? "yes" : "no");
++	PX4_INFO("Drive time limits: no progress %.1f s, total %.1f s (DShot hard limit 3.0 s)",
++		 (double)_param_no_progress_time.get(), (double)_param_drive_time.get());
++	PX4_INFO("Throttle slew: %.2f /s (zero roll rate), hard throttle limit %.2f",
++		 (double)_param_throttle_slew.get(), (double)turtle_recovery::HARD_MAX_THROTTLE);
++	PX4_INFO("Observation: %s, input: AUX%" PRId32, _param_obs_en.get() ? "enabled" : "disabled", _param_aux.get());
++	const char *position = "UNKNOWN (invalid/stale)";
++
++	switch (_switch_position) {
++	case turtle_recovery::SwitchPosition::High: position = "HIGH (+1)"; break;
++
++	case turtle_recovery::SwitchPosition::Low: position = "LOW (-1)"; break;
++
++	case turtle_recovery::SwitchPosition::Middle: position = "MIDDLE"; break;
++
++	case turtle_recovery::SwitchPosition::Unknown: break;
++	}
++
++	PX4_INFO("Switch: %s", position);
++	PX4_INFO("RC: %s, AUX: %.2f, OFF seen: %s, observing: %s, requests: %u",
++		 _rc_valid ? "valid" : "invalid/stale", (double)_aux, _trigger.seenOff() ? "yes" : "no",
++		 _observing ? "yes" : "no", _trigger_count);
++	PX4_INFO("Vehicle: %s", !_status_valid ? "unknown/stale" :
++		 (_vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED ? "armed" : "disarmed"));
++	PX4_INFO("Attitude: %s, tilt: %.1f deg, body-down alignment: %.3f", _attitude_valid ? "valid" : "invalid/stale",
++		 (double)_tilt_deg, (double)_alignment);
++	PX4_INFO("Gyro: %s, roll rate: %.1f deg/s (+ = body-right roll)", _gyro_valid ? "valid" : "invalid/stale",
++		 (double)_roll_rate_deg_s);
++	PX4_INFO("Land detector (recovery entry gate): %s", !_land_valid ? "unknown/stale" :
++		 (_land.landed ? "landed" : "not landed"));
++	PX4_INFO("Geometry: %s, right logical motor mask: 0x%x", _geometry_valid ? "supported" : "unsupported",
++		 (unsigned)_right_motor_mask);
++
++	if (_geometry_valid) {
++		for (unsigned i = 0; i < 4; ++i) {
++			PX4_INFO("Motor %u: y=%.3f, %s", i + 1, (double)_position_y[i],
++				 (_right_motor_mask & (1u << i)) ? "RIGHT (recovery motor)" : "LEFT");
++		}
++	}
++
++	return PX4_OK;
++}
++
++int TurtleRecovery::task_spawn(int argc, char *argv[])
++{
++	TurtleRecovery *instance = new TurtleRecovery();
++
++	if (instance) {
++		_object.store(instance);
++		_task_id = task_id_is_work_queue;
++		instance->ScheduleOnInterval(20_ms);
++		return PX4_OK;
++	}
++
++	PX4_ERR("alloc failed");
++	return PX4_ERROR;
++}
++
++int TurtleRecovery::print_usage(const char *reason)
++{
++	if (reason) {
++		PX4_WARN("%s", reason);
++	}
++
++	PRINT_MODULE_DESCRIPTION(R"DESCR_STR(
++### Description
++Observe RC input, quaternion attitude, roll rate and right-side motor geometry.
++TRTL_ENABLE separately enables powered disarmed recovery using Motor 1 and 4.
++Requires LOW then HIGH, low throttle, inverted rest, valid sensors and landed.
++Recovery stops on switch OFF, RC loss, invalid sensors, wrong direction or timeout.
++The DShot backend independently stops and restores direction on lease expiration.
++Enable TRTL_OBS_EN and map a spare RC switch to the AUX input selected by TRTL_AUX.
++Switch position is displayed directly. Observation follows HIGH while enabled
++and disarmed. Requests count OFF-to-ON transitions separately; starting with ON
++or recovering from RC loss requires OFF before another request is counted.
++Remove all propellers for initial tests. Starts at boot on MicoAir H743 V2 when
++TRTL_ENABLE is set. Normal flight arming is inhibited until direction is restored.
++)DESCR_STR");
++	PRINT_MODULE_USAGE_NAME("turtle_recovery", "system");
++	PRINT_MODULE_USAGE_COMMAND("start");
++	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
++	return PX4_OK;
++}
++
++extern "C" __EXPORT int turtle_recovery_main(int argc, char *argv[])
++{
++	return TurtleRecovery::main(argc, argv);
++}
+diff --git a/src/modules/turtle_recovery/TurtleRecoveryTest.cpp b/src/modules/turtle_recovery/TurtleRecoveryTest.cpp
+new file mode 100644
+index 0000000000..9619ce2b5f
+--- /dev/null
++++ b/src/modules/turtle_recovery/TurtleRecoveryTest.cpp
+@@ -0,0 +1,530 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// Copyright (c) 2026 PX4 Development Team. All rights reserved.
++#include <turtle_recovery/TurtleOutputGuard.hpp>
++#include <turtle_recovery/TurtleFlipController.hpp>
++#include <gtest/gtest.h>
++
++using namespace turtle_recovery;
++
++struct OutputFixture {
++	TurtleOutputGuard guard;
++	uint64_t now{1000000};
++	Request request{1000000, 42, Action::Prepare, 0.f};
++	OutputPermission permission{true, true, true, true, true, 0x9, 0xf, 0.12f};
++	OutputFrame tick(uint64_t dt = 20000, bool renew = true)
++	{
++		now += dt;
++
++		if (renew) { request.timestamp = now; }
++
++		return guard.update(now, request, permission);
++	}
++	void ready()
++	{
++		EXPECT_EQ(tick().kind, FrameKind::Stop);
++
++		for (unsigned i = 0; i < 10; ++i) {
++			const auto frame = tick(i == 0 ? 500000 : 20000);
++			EXPECT_EQ(frame.kind, FrameKind::Reverse);
++			guard.frameSent(frame.kind);
++		}
++
++		EXPECT_EQ(guard.state(), OutputState::Ready);
++		EXPECT_TRUE(guard.dirty());
++	}
++	void restored()
++	{
++		for (unsigned i = 0; i < 10; ++i) {
++			const auto frame = tick(i == 0 ? 500000 : 20000, false);
++			EXPECT_EQ(frame.kind, FrameKind::Restore);
++			guard.frameSent(frame.kind);
++		}
++
++		EXPECT_FALSE(guard.busy());
++		EXPECT_FALSE(guard.dirty());
++	}
++};
++
++TEST(TurtleOutputGuard, RejectsMissingLeaseAndUprightEntry)
++{
++	OutputFixture f;
++	f.request.timestamp = 0;
++	EXPECT_EQ(f.tick(20000, false).kind, FrameKind::None);
++	f.permission.entry = false;
++	EXPECT_EQ(f.tick().kind, FrameKind::None);
++	EXPECT_FALSE(f.guard.busy());
++}
++
++TEST(TurtleOutputGuard, OnlySelectedPinsReceiveBoundedThrottle)
++{
++	OutputFixture f;
++	f.ready();
++	f.request.action = Action::Drive;
++	f.request.throttle = 1.f;
++	auto frame = f.tick();
++	EXPECT_EQ(frame.kind, FrameKind::Throttle);
++	EXPECT_EQ(frame.mask, 0x9);
++	EXPECT_FLOAT_EQ(frame.throttle, 0.12f);
++	f.permission.throttle_limit = 0.4f;
++	EXPECT_FLOAT_EQ(f.tick().throttle, 0.4f);
++	f.permission.throttle_limit = 1.f;
++	EXPECT_FLOAT_EQ(f.tick().throttle, 0.8f);
++}
++
++TEST(TurtleOutputGuard, ControllerDeathStopsAndRestoresWithoutHeartbeat)
++{
++	OutputFixture f;
++	f.ready();
++	f.request.action = Action::Drive;
++	f.request.throttle = 0.1f;
++	ASSERT_EQ(f.tick().kind, FrameKind::Throttle);
++	EXPECT_EQ(f.tick(LEASE_US, false).kind, FrameKind::Stop);
++	EXPECT_EQ(f.guard.state(), OutputState::StopRestore);
++	f.permission.enabled = false;
++	f.permission.live = false;
++	f.restored();
++}
++
++TEST(TurtleOutputGuard, KillStopsThrustAndDefersDirectionCommands)
++{
++	OutputFixture f;
++	f.ready();
++	f.request.action = Action::Drive;
++	f.request.throttle = 0.1f;
++	f.tick();
++	f.permission.stop_safe = false;
++	EXPECT_EQ(f.tick().kind, FrameKind::Stop);
++	EXPECT_EQ(f.tick(1000000).kind, FrameKind::Stop);
++	EXPECT_TRUE(f.guard.dirty());
++	f.permission.stop_safe = true;
++	EXPECT_EQ(f.tick().kind, FrameKind::Stop);
++	f.restored();
++}
++
++TEST(TurtleOutputGuard, PartialReverseIsDirtyAndRestored)
++{
++	OutputFixture f;
++	f.tick();
++	auto frame = f.tick(500000);
++	f.guard.frameSent(frame.kind);
++	EXPECT_TRUE(f.guard.dirty());
++	f.request.action = Action::Stop;
++	EXPECT_EQ(f.tick().kind, FrameKind::Stop);
++	f.restored();
++}
++
++TEST(TurtleOutputGuard, MappingChangeRestoresOriginalPins)
++{
++	OutputFixture f;
++	f.ready();
++	f.permission.right_mask = 0x6;
++	EXPECT_EQ(f.tick().kind, FrameKind::Stop);
++	const auto frame = f.tick(500000);
++	EXPECT_EQ(frame.kind, FrameKind::Restore);
++	EXPECT_EQ(frame.mask, 0x9);
++}
++
++TEST(TurtleOutputGuard, StartupRestoresWhileRcIsUnavailable)
++{
++	OutputFixture f;
++	f.permission.enabled = false;
++	f.permission.live = false;
++	f.request.timestamp = 0;
++	f.guard.restore(f.now, 0xf);
++	EXPECT_EQ(f.tick(20000, false).kind, FrameKind::Stop);
++	f.restored();
++}
++
++TEST(TurtleOutputGuard, CompletedSessionCannotRestart)
++{
++	OutputFixture f;
++	f.ready();
++	f.request.action = Action::Stop;
++	f.tick();
++	f.restored();
++	f.request.action = Action::Prepare;
++	EXPECT_EQ(f.tick().kind, FrameKind::None);
++	f.request.session = 43;
++	EXPECT_EQ(f.tick().kind, FrameKind::Stop);
++}
++
++TEST(TurtleOutputGuard, NaNThrottleStopsAndDriveHasHardTimeout)
++{
++	OutputFixture f;
++	f.ready();
++	f.request.action = Action::Drive;
++	f.request.throttle = NAN;
++	EXPECT_EQ(f.tick().kind, FrameKind::Stop);
++	EXPECT_EQ(f.guard.state(), OutputState::StopRestore);
++	OutputFixture g;
++	g.ready();
++	g.request.action = Action::Drive;
++	g.request.throttle = 0.1f;
++	g.tick();
++	EXPECT_EQ(g.tick(3000000).kind, FrameKind::Stop);
++}
++
++struct FlipFixture {
++	TurtleFlipController controller;
++	TurtleFlipController::Input in{};
++	TurtleFlipController::Settings settings{};
++	FlipFixture()
++	{
++		in.now = 1000000;
++		in.enabled = in.safe = in.entry = in.feedback_fresh = in.backend_idle = in.backend_clean = true;
++		in.tilt = 180.f;
++		in.phase = 3.14159265f;
++	}
++	Request tick(uint64_t dt = 20000) { in.now += dt; return controller.update(in, settings); }
++	void drive()
++	{
++		in.low = true; tick(); in.low = false; in.high = true; tick();
++		ASSERT_EQ(tick(500000).action, Action::Prepare);
++		in.backend_session = controller.session();
++		in.backend_idle = in.backend_clean = false;
++		in.backend_ready = true;
++		EXPECT_EQ(tick().action, Action::Drive);
++	}
++};
++
++TEST(TurtleFlipController, HighAtStartupAndUprightCannotStart)
++{
++	FlipFixture f;
++	f.in.high = true;
++	EXPECT_EQ(f.tick().action, Action::Stop);
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Idle);
++	f.in.high = false; f.in.low = true; f.tick();
++	f.in.low = false; f.in.high = true; f.in.entry = false;
++	EXPECT_EQ(f.tick().action, Action::Stop);
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Failed);
++}
++
++TEST(TurtleFlipController, PositiveRollWrapReleaseAndStableUprightCompletion)
++{
++	FlipFixture f;
++	f.drive();
++	f.in.phase = -3.14159265f + 0.174532925f;
++	f.in.tilt = 170.f; f.in.roll_rate = 60.f;
++	EXPECT_EQ(f.tick().action, Action::Drive);
++	EXPECT_NEAR(f.controller.progress(), 10.f, 1e-3f);
++	f.in.phase = -3.14159265f + 1.57079633f; f.in.tilt = 90.f;
++	EXPECT_EQ(f.tick(200000).action, Action::Drive);
++	f.in.phase = -3.14159265f + 2.18166156f; f.in.tilt = 55.f;
++	EXPECT_EQ(f.tick(200000).action, Action::Stop);
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Coast);
++	f.in.tilt = 5.f; f.in.gyro_norm = 1.f; f.tick();
++	f.in.backend_idle = f.in.backend_clean = true; f.in.backend_ready = false;
++	f.tick(600000);
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Done);
++	EXPECT_EQ(f.tick().action, Action::Stop); // HIGH held: no repeat
++}
++
++TEST(TurtleFlipController, SwitchOffOrInvalidSensorStopsImmediately)
++{
++	FlipFixture f; f.drive();
++	f.in.safe = false;
++	EXPECT_EQ(f.tick().action, Action::Stop);
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Cleanup);
++	f.in.backend_idle = f.in.backend_clean = true;
++	f.tick();
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Failed);
++	FlipFixture g; g.drive(); g.in.high = false;
++	EXPECT_EQ(g.tick().action, Action::Stop);
++}
++
++TEST(TurtleFlipController, WrongRollAndNoProgressAbort)
++{
++	FlipFixture f; f.drive(); f.in.roll_rate = -40.f;
++	EXPECT_EQ(f.tick().action, Action::Stop);
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Cleanup);
++	FlipFixture g; g.drive();
++	EXPECT_EQ(g.tick(1300000).action, Action::Stop);
++	EXPECT_EQ(g.controller.state(), TurtleFlipController::State::Cleanup);
++}
++
++TEST(TurtleFlipController, DefaultNoProgressStopsAtExactMicrosecond)
++{
++	FlipFixture f; f.drive();
++	EXPECT_EQ(f.tick(1199999).action, Action::Drive);
++	EXPECT_EQ(f.tick(1).action, Action::Stop);
++	EXPECT_STREQ(f.controller.reason(), "no roll progress");
++}
++
++TEST(TurtleFlipController, ExtendedNoProgressAllowsLongerDriveWithoutRemovingTimeout)
++{
++	FlipFixture f;
++	f.settings.no_progress_timeout = 2.f;
++	f.settings.drive_timeout = 2.8f;
++	f.drive();
++	EXPECT_EQ(f.tick(1200000).action, Action::Drive);
++	EXPECT_EQ(f.tick(799999).action, Action::Drive);
++	EXPECT_EQ(f.tick(1).action, Action::Stop);
++	EXPECT_STREQ(f.controller.reason(), "no roll progress");
++}
++
++TEST(TurtleFlipController, ExtendedTotalTimeoutStopsEvenWhenRollHasProgress)
++{
++	FlipFixture f;
++	f.settings.no_progress_timeout = 2.5f;
++	f.settings.drive_timeout = 2.8f;
++	f.drive();
++	f.in.phase = -3.14159265f + 0.104719755f;
++	f.in.tilt = 174.f;
++	ASSERT_EQ(f.tick().action, Action::Drive);
++	ASSERT_GT(f.controller.progress(), 5.f);
++	EXPECT_EQ(f.tick(2779999).action, Action::Drive);
++	EXPECT_EQ(f.tick(1).action, Action::Stop);
++	EXPECT_STREQ(f.controller.reason(), "drive timeout");
++}
++
++TEST(TurtleFlipController, EqualTimeoutsReportTotalDriveTimeout)
++{
++	FlipFixture f;
++	f.settings.no_progress_timeout = f.settings.drive_timeout = 2.5f;
++	f.drive();
++	EXPECT_EQ(f.tick(2499999).action, Action::Drive);
++	EXPECT_EQ(f.tick(1).action, Action::Stop);
++	EXPECT_STREQ(f.controller.reason(), "drive timeout");
++}
++
++TEST(TurtleFlipController, MinimumTimeoutIsSupported)
++{
++	FlipFixture f;
++	f.settings.no_progress_timeout = f.settings.drive_timeout = 0.5f;
++	f.drive();
++	EXPECT_EQ(f.tick(499999).action, Action::Drive);
++	EXPECT_EQ(f.tick(1).action, Action::Stop);
++	EXPECT_STREQ(f.controller.reason(), "drive timeout");
++}
++
++TEST(TurtleFlipController, InvalidTimeSettingsCannotStart)
++{
++	const float times[][2] {
++		{NAN, 2.5f}, {1.2f, NAN}, {INFINITY, 2.5f}, {1.2f, INFINITY},
++		{0.49f, 2.5f}, {2.51f, 2.8f}, {0.5f, 0.49f}, {1.2f, 2.81f}, {2.f, 1.5f}
++	};
++
++	for (const auto &time : times) {
++		FlipFixture f;
++		f.settings.no_progress_timeout = time[0];
++		f.settings.drive_timeout = time[1];
++		f.in.low = true;
++		f.tick();
++		f.in.low = false;
++		f.in.high = true;
++		EXPECT_EQ(f.tick().action, Action::Stop);
++		EXPECT_FALSE(f.controller.active());
++		EXPECT_EQ(f.controller.session(), 0u);
++		EXPECT_STREQ(f.controller.reason(), "invalid recovery time settings");
++	}
++}
++
++TEST(TurtleFlipController, InvalidTimeDuringDriveStopsAndCleanupStillCompletes)
++{
++	FlipFixture f; f.drive();
++	f.settings.drive_timeout = NAN;
++	EXPECT_EQ(f.tick().action, Action::Stop);
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Cleanup);
++	EXPECT_STREQ(f.controller.reason(), "invalid recovery time settings");
++	f.in.backend_idle = f.in.backend_clean = true;
++	f.tick();
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Failed);
++}
++
++TEST(TurtleFlipController, ExtendedTimeoutDoesNotDelaySafetyStops)
++{
++	for (unsigned condition = 0; condition < 3; ++condition) {
++		FlipFixture f;
++		f.settings.no_progress_timeout = 2.f;
++		f.settings.drive_timeout = 2.8f;
++		f.drive();
++
++		if (condition == 0) { f.in.high = false; }
++
++		if (condition == 1) { f.in.safe = false; }
++
++		if (condition == 2) { f.in.feedback_fresh = false; }
++
++		EXPECT_EQ(f.tick().action, Action::Stop);
++		EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Cleanup);
++	}
++}
++
++TEST(TurtleFlipController, ConfiguredSlewCanReachEightTenthsWithoutOvershoot)
++{
++	FlipFixture f;
++	f.settings.max_throttle = 0.8f;
++	f.settings.throttle_slew = 1.f;
++	f.settings.no_progress_timeout = 2.f;
++	f.settings.drive_timeout = 2.8f;
++	f.drive();
++	float peak = 0.f;
++
++	for (unsigned i = 0; i < 50; ++i) {
++		const auto request = f.tick();
++		ASSERT_EQ(request.action, Action::Drive);
++		EXPECT_LE(request.throttle, 0.8f);
++		peak = fmaxf(peak, request.throttle);
++	}
++
++	EXPECT_FLOAT_EQ(peak, 0.8f);
++	EXPECT_FLOAT_EQ(f.controller.throttle(), 0.8f);
++	f.in.high = false;
++	EXPECT_EQ(f.tick().action, Action::Stop);
++	EXPECT_FLOAT_EQ(f.controller.throttle(), 0.f);
++}
++
++TEST(TurtleFlipController, DefaultSlewCannotReachEightTenthsBeforeTotalTimeout)
++{
++	FlipFixture f;
++	f.settings.max_throttle = 0.8f;
++	f.settings.no_progress_timeout = 2.5f;
++	f.settings.drive_timeout = 2.8f;
++	f.drive();
++	f.in.phase = -3.14159265f + 0.104719755f;
++	f.in.tilt = 174.f; // progress prevents the no-progress timeout, isolating total duration
++	float peak = 0.f;
++
++	for (unsigned i = 0; i < 140; ++i) {
++		const auto request = f.tick();
++		peak = fmaxf(peak, request.throttle);
++	}
++
++	EXPECT_NEAR(peak, 0.695f, 1e-4f);
++	EXPECT_LT(peak, 0.8f);
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Cleanup);
++	EXPECT_STREQ(f.controller.reason(), "drive timeout");
++}
++
++TEST(TurtleFlipController, FasterSlewStillRespectsRollRateFeedback)
++{
++	FlipFixture f;
++	f.settings.max_throttle = 0.8f;
++	f.settings.throttle_slew = 1.f;
++	f.drive();
++	EXPECT_NEAR(f.tick().throttle, 0.02f, 1e-6f);
++	f.in.roll_rate = 120.f;
++	EXPECT_NEAR(f.tick().throttle, 0.02f, 1e-6f);
++	f.in.roll_rate = 180.f;
++	EXPECT_NEAR(f.tick().throttle, 0.01f, 1e-6f); // fixed 0.5/s decrease is retained
++}
++
++TEST(TurtleFlipController, MinimumSlewIsSupported)
++{
++	FlipFixture f;
++	f.settings.throttle_slew = 0.1f;
++	f.drive();
++	EXPECT_NEAR(f.tick().throttle, 0.002f, 1e-6f);
++}
++
++TEST(TurtleFlipController, InvalidSlewCannotStart)
++{
++	for (float slew : {NAN, INFINITY, -1.f, 0.f, 0.09f, 1.01f}) {
++		FlipFixture f;
++		f.settings.throttle_slew = slew;
++		f.in.low = true; f.tick(); f.in.low = false; f.in.high = true;
++		EXPECT_EQ(f.tick().action, Action::Stop);
++		EXPECT_FALSE(f.controller.active());
++		EXPECT_STREQ(f.controller.reason(), "invalid recovery throttle slew");
++	}
++}
++
++TEST(TurtleFlipController, InvalidSlewDuringDriveStopsAndCleansUp)
++{
++	FlipFixture f; f.drive();
++	f.settings.throttle_slew = NAN;
++	EXPECT_EQ(f.tick().action, Action::Stop);
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Cleanup);
++	EXPECT_STREQ(f.controller.reason(), "invalid recovery throttle slew");
++	f.in.backend_idle = f.in.backend_clean = true;
++	f.tick();
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Failed);
++}
++
++TEST(TurtleFlipController, MovementDuringReverseCancelsBeforeAnyDrive)
++{
++	FlipFixture f;
++	f.in.low = true; f.tick(); f.in.low = false; f.in.high = true; f.tick();
++	ASSERT_EQ(f.tick(500000).action, Action::Prepare);
++	f.in.backend_session = f.controller.session();
++	f.in.backend_ready = true;
++	f.in.entry = false;
++	EXPECT_EQ(f.tick().action, Action::Stop);
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Cleanup);
++}
++
++TEST(TurtleFlipController, RejectedRetryAfterPreviousSessionDoesNotWaitForWrongFeedback)
++{
++	FlipFixture f; f.drive();
++	f.in.high = false;
++	f.tick();
++	f.in.backend_idle = f.in.backend_clean = true;
++	f.tick();
++	ASSERT_EQ(f.controller.state(), TurtleFlipController::State::Failed);
++	f.in.low = true; f.tick(); f.in.low = false; f.in.high = true; f.tick();
++	ASSERT_EQ(f.controller.state(), TurtleFlipController::State::Qualify);
++	f.in.high = false;
++	f.tick();
++	EXPECT_EQ(f.controller.state(), TurtleFlipController::State::Failed);
++}
++
++TEST(TurtleRecoveryIntegration, RightRollRestoresAndHeldHighCannotRestart)
++{
++	TurtleFlipController controller;
++	TurtleOutputGuard guard;
++	TurtleFlipController::Input in{};
++	TurtleFlipController::Settings settings{};
++	OutputPermission permission{true, true, true, true, true, 0x9, 0xf, 0.12f};
++	uint64_t now = 1000000;
++	guard.restore(now, 0xf);
++	Request request{};
++	unsigned reverse_frames = 0, restore_frames = 0, drive_frames = 0;
++	float roll_progress = 0.f;
++	bool powered = false;
++
++	for (unsigned step = 0; step < 1100; ++step) {
++		now += 5000;
++		in.now = now;
++		in.enabled = in.safe = in.feedback_fresh = true;
++		in.low = step < 200;
++		in.high = !in.low;
++		in.backend_session = guard.session();
++		in.backend_idle = !guard.busy();
++		in.backend_clean = !guard.dirty();
++		in.backend_ready = guard.state() == OutputState::Ready || guard.state() == OutputState::Driving;
++		in.entry = roll_progress < 1.f;
++		in.tilt = fmaxf(0.f, 180.f - roll_progress);
++		in.phase = 3.14159265f + roll_progress * 0.0174532925f;
++		in.roll_rate = powered ? 120.f : 0.f;
++		in.gyro_norm = in.roll_rate;
++
++		if (step % 4 == 0) { request = controller.update(in, settings); }
++
++		const auto frame = guard.update(now, request, permission);
++
++		if (frame.kind == FrameKind::Reverse) { ++reverse_frames; EXPECT_EQ(frame.mask, 0x9); }
++
++		if (frame.kind == FrameKind::Restore) { ++restore_frames; }
++
++		if (frame.kind == FrameKind::Throttle && frame.throttle > 0.f) {
++			++drive_frames;
++			powered = true;
++			EXPECT_EQ(frame.mask, 0x9);
++			EXPECT_LE(frame.throttle, settings.max_throttle);
++		}
++
++		guard.frameSent(frame.kind);
++
++		// Simulate inertia completing a positive roll after thrust release.
++		if (powered) { roll_progress = fminf(180.f, roll_progress + 0.6f); }
++
++		if (roll_progress >= 180.f) { powered = false; }
++	}
++
++	EXPECT_GT(drive_frames, 0u);
++	EXPECT_EQ(reverse_frames, 10u);
++	EXPECT_EQ(restore_frames, 20u); // startup all four, then the recovery pair
++	EXPECT_FALSE(guard.busy());
++	EXPECT_FALSE(guard.dirty());
++	EXPECT_EQ(controller.state(), TurtleFlipController::State::Done);
++}
+diff --git a/src/modules/turtle_recovery/turtle_recovery_params.c b/src/modules/turtle_recovery/turtle_recovery_params.c
+new file mode 100644
+index 0000000000..7f0d5bde38
+--- /dev/null
++++ b/src/modules/turtle_recovery/turtle_recovery_params.c
+@@ -0,0 +1,155 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++//定义 TRTL_OBS_EN、TRTL_AUX   定义油门、爬升率、收油角、时限等参数
++/**
++ * Enable turtle recovery observation
++ *
++ * Enables RC switch observation only. The turtle_recovery module must be
++ * started manually. Motor output is separately controlled by TRTL_ENABLE.
++ *
++ * @boolean
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_INT32(TRTL_OBS_EN, 0);
++
++/**
++ * Turtle recovery AUX input
++ *
++ * Selects manual_control_setpoint AUX1 through AUX6. Map a spare RC channel
++ * using the corresponding RC_MAP_AUX parameter. Powered recovery requires
++ * a valid RC source, a disarmed vehicle, and an OFF to ON switch transition.
++ *
++ * @min 1
++ * @max 6
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_INT32(TRTL_AUX, 1);
++
++/**
++ * Enable powered automatic right-side turtle recovery
++ *
++ * Allows disarmed Motor 1 and Motor 4 to reverse and run briefly when inverted.
++ * Requires RC LOW followed by HIGH, low throttle, valid attitude, landed and rest.
++ * Starts turtle_recovery at boot on MicoAir H743 V2. Remove props for first tests.
++ *
++ * @boolean
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_INT32(TRTL_ENABLE, 0);
++
++/**
++ * Maximum recovery DShot throttle fraction
++ *
++ * This is a protocol throttle fraction, not physical power or thrust percent.
++ * Recovery duration is bounded by TRTL_DRV_T and TRTL_NP_T.
++ *
++ * @min 0.05
++ * @max 0.8
++ * @decimal 2
++ * @increment 0.01
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_FLOAT(TRTL_MAX_THR, 0.2f);
++
++/**
++ * Target positive roll rate during recovery
++ *
++ * @min 30
++ * @max 200
++ * @unit deg/s
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_FLOAT(TRTL_R_RATE, 120.f);
++
++/**
++ * Remaining tilt at recovery thrust release
++ *
++ * Stop thrust before upright and let inertia and ground contact finish the roll.
++ * A short rate-based prediction may release thrust earlier.
++ *
++ * @min 30
++ * @max 90
++ * @unit deg
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_FLOAT(TRTL_REL_ANG, 75.f);
++
++/**
++ * Recovery no-progress timeout
++ *
++ * Stops recovery if positive roll progress is below 5 degrees after this time.
++ * Measured from drive entry, including throttle ramp. Must not exceed TRTL_DRV_T.
++ * Change only while idle. Switch OFF and other stop conditions still take priority.
++ *
++ * @min 0.5
++ * @max 2.5
++ * @unit s
++ * @decimal 1
++ * @increment 0.1
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_FLOAT(TRTL_NP_T, 1.2f);
++
++/**
++ * Recovery total drive timeout
++ *
++ * Maximum duration of the drive phase, including throttle ramp.
++ * Must be at least TRTL_NP_T. Does not extend the independent DShot 3 second limit.
++ * Change only while idle. Reaching the release angle or other stop conditions ends drive sooner.
++ *
++ * @min 0.5
++ * @max 2.8
++ * @unit s
++ * @decimal 1
++ * @increment 0.1
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_FLOAT(TRTL_DRV_T, 2.5f);
++
++/**
++ * Recovery throttle increase slew rate
++ *
++ * Normalized DShot throttle increase per second at zero roll rate.
++ * For example 0.5 takes about 1 second to rise from zero to 0.5 while stationary.
++ * Positive roll reduces the increase; above TRTL_R_RATE throttle decreases.
++ * The requested throttle may not be reached before a stop condition or timeout.
++ * Change only while idle. Does not change the recovery timeouts or ESC direction waits.
++ *
++ * @min 0.1
++ * @max 1.0
++ * @unit 1/s
++ * @decimal 2
++ * @increment 0.05
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_FLOAT(TRTL_THR_SLEW, 0.25f);

@@ -1,0 +1,12 @@
+#!/bin/sh
+#
+# board specific extras init
+#------------------------------------------------------------------------------
+
+# enable onboard OSD chip
+# atxxxx start -s
+
+if param compare TRTL_ENABLE 1
+then
+	turtle_recovery start
+fi

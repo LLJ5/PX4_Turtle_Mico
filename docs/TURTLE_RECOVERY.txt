@@ -1,0 +1,140 @@
+PX4 自动右翻开发版：倒扣时 Motor 1、4 反转出力
+
+本目录集中保存本功能涉及的 22 个源码、消息和配置文件，保留原名、原内容和相对路径。
+这里是逐字节同步的源码副本；编译仍使用工程根目录下对应文件。
+用户原有的 PID 等无关改动不在这份清单里。
+旧 turtle_recovery_review/ 中的 stage1 文件是历史观察阶段快照，不能用来覆盖当前实现。
+
+当前实现
+
+翻身电机输出由 DShot 专用通道提供，
+不强制解锁 Commander，不关闭正常预检、姿态故障检查、急停或终止功能。
+所以在倒扣状态查看 actuator_armed，armed: False 是本方案的预期结果。
+Motor 1、4 是逻辑电机编号，驱动根据输出功能映射找到真实 DShot 引脚。
+当前只支持 CA_AIRFRAME=0、四旋翼、1/4 在右侧且 2/3 在左侧的几何布局。
+翻身期间普通飞行的 armed 状态保持 false。
+
+固定右翻定义：绕机体 +X 轴正转，roll rate 为正；正立时右侧向下。
+四元数计算正反面，结合横滚相位展开和陀螺仪跟踪方向。
+180 度附近的相位跨界会展开，不用欧拉角直接相减。
+这套固定横滚方案限制机头轴接近水平，不适用于大俯仰的任意侧翻姿态。
+
+代码阅读顺序
+
+1. src/modules/turtle_recovery/turtle_recovery_params.c
+   TRTL_ENABLE：实际翻身输出总开关，默认 0。
+   TRTL_OBS_EN：观察显示和开关计数，独立于实际输出开关。
+   TRTL_AUX：选择 AUX1..6，默认 1。
+   TRTL_MAX_THR：DShot 油门比例上限，当前源码默认 0.20（用户修改），允许 0.05..0.80。
+   TRTL_THR_SLEW：零滚速时油门上升率，默认 0.25/s，允许 0.10..1.00/s。
+   TRTL_R_RATE：期望正向横滚速度，默认 120 deg/s。
+   TRTL_REL_ANG：停止出力时的剩余倾角，默认 75 deg。
+   TRTL_NP_T：无进展等待时长，默认 1.2 s，允许 0.5..2.5 s。
+   TRTL_DRV_T：总出力时长上限，默认 2.5 s，允许 0.5..2.8 s，且不小于 TRTL_NP_T。
+   上述油门比例不是推力比例，也不是电机物理功率百分比。
+   0.80 是 DShot 油门上限，不是最大转速；实际峰值还受爬升率、姿态反馈和停止条件影响。
+2. src/lib/turtle_recovery/TurtleProtocol.hpp
+   控制器与驱动共享的状态、请求、输出类型和固定逻辑电机掩码 0x9。
+3. src/lib/turtle_recovery/TurtleFlipController.hpp
+   纯控制流程：等待 LOW/HIGH、静止确认、准备反转、正向出力、滑行、清理、完成/失败。
+   默认最多出力 2.5 s，1.2 s 后进展不足 5 deg 则退出；可通过上述两个时间参数调整。
+   无进展报告 no roll progress，总时长超时报告 drive timeout；方向错误也退出。
+   接近设定倾角时提前收油，利用惯性和地面接触继续翻转；过快则提前收油。
+   回到倾角 <25 deg、角速度 <10 deg/s 并持续 500 ms，且驱动恢复完毕，才显示完成。
+   滑行 4 s 未稳定回正则记为失败；保持 HIGH 不会重复启动。
+4. src/modules/turtle_recovery/TurtleRecovery.cpp
+   每 20 ms 读取遥控、四元数姿态、角速度、解锁状态和落地信息。
+   检查遥控来自 RC、数据有效、油门低于 -0.8、未解锁、无急停/终止/校准等条件。
+   起动还要求倒扣倾角 >150 deg、机头轴近水平、角速度 <10 deg/s、落地、静止 500 ms。
+   发送短有效期的 uORB 请求，不直接设置正常 actuator_motors。
+5. src/lib/turtle_recovery/TurtleOutputGuard.hpp
+   在 DShot 工作线程独立运行。停止输出 500 ms -> 发送 10 帧 21 -> 准备/出力。
+   停机后等待 500 ms -> 发送 10 帧 20 恢复已保存的转向。
+   控制请求有效期 200 ms，驱动另有 3 s 连续出力硬上限。
+   控制模块退出/卡住、关开关、丢 RC、传感器无效等会停止出力并由驱动自行恢复。
+   急停、锁定、终止状态下立即停止出力；解除这些状态后才继续发送恢复转向命令。
+6. src/drivers/dshot/DShot.cpp / DShot.h
+   独立复核遥控、姿态、油门和输出状态；查找并锁存实际引脚；仅给右侧两台电机出力。
+   其他电机保持停止；不允许与普通解锁输出、其他电调命令或电机测试同时出力。
+   TRTL_ENABLE 首次启用/重启后，先给四台电机发送恢复保存转向命令，再接受翻身请求。
+   保留拆桨手工命令 turtle_reverse / turtle_normal；不自动保存电调设置。
+7. src/modules/commander/Commander.cpp / Commander.hpp
+   正在翻身或转向尚未恢复时，拒绝普通飞行解锁，包括跳过预检的强制解锁入口。
+   恢复完成后仍由原有预检决定能否正常解锁。
+8. msg/TurtleRecoveryControl.msg / TurtleRecoveryFeedback.msg / CMakeLists.txt
+   带有效期的请求与驱动反馈。
+9. boards/micoair/h743-v2/default.px4board / init/rc.board_extras
+   将模块编入固件；保存 TRTL_ENABLE=1 后，后续上电会自动启动模块。
+10. 其余 CMake/Kconfig 文件用于构建注册，三个 Test.cpp 用于软件测试。
+    TurtleObserver.hpp 保留原有姿态、开关和几何辅助逻辑及中文注释。
+
+拆桨验证流程
+
+1. 备份正常飞行参数，拆掉全部螺旋桨；此阶段不做带桨翻身。
+   编译：make micoair_h743-v2_default -j4
+   通过 QGC 刷入 build/micoair_h743-v2_default/micoair_h743-v2_default.px4。
+2. 油门最低、普通解锁开关关闭、翻身开关 LOW，电调供电，飞控保持未解锁。
+   控制台执行：
+
+   param set RC_MAP_AUX1 6
+   param set TRTL_AUX 1
+   param set TRTL_OBS_EN 1
+   param set TRTL_MAX_THR 0.12
+   param set TRTL_R_RATE 120
+   param set TRTL_REL_ANG 75
+   param set TRTL_DRV_T 2.5
+   param set TRTL_NP_T 1.2
+   param set TRTL_ENABLE 1
+   param save
+   turtle_recovery start
+   turtle_recovery status
+   dshot status
+
+   如果模块已经运行，不重复 start，直接 status。
+   先保存 ENABLE，再进行尝试，使飞控单独重启后仍能执行初始化转向恢复。
+3. 等待 DShot 初始化恢复完成：backend state 0、busy no、direction dirty no。
+   安全开关需已释放；不要绕过急停/终止、正常预检或姿态故障检查。
+4. 将拆桨飞机倒扣静置，先 LOW 再 HIGH，油门仍最低，不操作普通解锁。
+   status 应显示 safe yes、inverted rest yes、feedback fresh yes，然后进入准备与出力。
+   预期只有 Motor 1、4 临时反向转动，Motor 2、3 保持停止。
+   拆桨后没有翻滚进展，约 TRTL_NP_T（默认 1.2 s）出力阶段后会停止并恢复，最终通常为失败状态。
+   这是拆桨无进展退出的预期结果，不等于已经完成真实翻身。
+5. 在另一次拆桨测试中，出力时关到 LOW，确认立即停机，随后恢复转向。
+   若要验证姿态变化后的收油，在合适的拆桨转动夹具上模拟正向横滚；不要带桨手持测试。
+6. 检查 turtle_recovery status 和 dshot status。
+   出力结束后等 backend busy no、direction dirty no，再用拆桨电机测试核对实际转向。
+   每次重试均须重新 LOW -> HIGH；上电就在 HIGH 不启动。
+   TX 完成只表示发送结束，不代表电调确认；500 ms 也不是实测机械停转时间。
+7. 带桨翻正仍须在受控场地单独验证，并按机架重量、支点、桨叶触地情况调整输出与收油时机。
+   0.12 只是较低的初始油门上限，不能保证特定机架足够翻身。
+   更高油门上限与爬升率的配置见 TUNING.txt。先拆桨验证，再逐步增加带桨试验输出。
+   不要因翻不动就一次性设到 0.80；先检查是否顶住、转向正确和真实滚转方向。
+   翻正后仍保持未解锁，不会自动起飞；先关闭翻身开关，再按正常流程解锁。
+
+状态编号
+
+时长调参的单行命令、允许范围和回退方法见本目录 TUNING.txt。
+新增时间参数必须刷入本次新固件后才可使用。
+
+控制模块 state：0 等待，1 倒扣静止确认，2 反转准备，3 出力，4 滑行等待回正，
+                 5 停机恢复清理，6 完成，7 失败。
+DShot backend state：0 空闲，1 反转前停机，2 发送反转，3 准备完成，4 出力，
+                     5 恢复前停机，6 发送恢复。
+进程 not running 时应先启动；TRTL_OBS_EN=1 本身不会启动实际出力。
+如果 safe no，用 listener actuator_armed、vehicle_status、manual_control_setpoint 检查门控条件。
+如果只有 inverted rest no，核对倾角、滚转速度、落地检测、机头轴姿态和几何参数。
+不要通过关闭故障检测或强制普通解锁解决翻身问题。
+
+停用
+
+先 LOW 等待停止并恢复。可执行 param set TRTL_ENABLE 0 关闭后续翻身请求。
+模块 stop 也会请求停机；即使模块消失，驱动仍负责超时停止与恢复。
+如果转向不确定，保持未解锁、拆桨，核实全部电机转向；完整断电会清除临时方向。
+手工方向试验期间不要执行 dshot save。
+
+验证边界
+
+已通过主机逻辑测试与 micoair_h743-v2_default 完整固件编译。
+这些测试覆盖状态机、转向发送、超时、传感器/开关中断和模拟右翻过程，
+不包含气动、地面碰撞、桨叶接触、电调实际确认或这台机架的带桨实测。
+先前已由用户确认 Bluejay 对手动 21/20 命令能正确反转/恢复 Motor 1、4。

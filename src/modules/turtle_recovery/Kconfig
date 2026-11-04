@@ -1,0 +1,7 @@
+menuconfig MODULES_TURTLE_RECOVERY
+	bool "turtle_recovery"
+	default n
+	---help---
+		Observe RC input, attitude and motor geometry for turtle recovery.
+		TRTL_ENABLE additionally enables automatic positive-roll recovery
+		using disarmed Motor 1 and Motor 4 through the guarded DShot backend.

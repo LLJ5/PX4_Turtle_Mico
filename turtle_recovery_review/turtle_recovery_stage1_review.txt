@@ -1,0 +1,856 @@
+PX4 自动右翻开发第一步 完整修改与中文说明
+
+一、这一步做什么
+
+硬件背景：Mico H743 V2 AIO、Bluejay 电调、已经能正常起飞的四旋翼。
+本步骤增加 turtle_recovery 观察模块，检查遥控输入、四元数姿态、右翻角速度符号和右侧候选电机。
+当前实现没有执行器消息发布，也没有 ESC 命令接口；它不能执行翻身。
+观察到倒扣、落地状态或开关触发，不代表已经通过允许电机启动的检查。
+
+二、改动清单
+
+共 7 个实现文件：1 个已有文件增加一行，6 个新文件。
+1. boards/micoair/h743-v2/default.px4board
+   已有文件增加一行 CONFIG_MODULES_TURTLE_RECOVERY=y，把模块编入 Mico H743 V2 固件。这不会让模块自动启动。
+2. src/modules/turtle_recovery/Kconfig
+   向 PX4 配置系统注册 MODULES_TURTLE_RECOVERY。全局默认关闭，由上面的板级配置选中。
+3. src/modules/turtle_recovery/CMakeLists.txt
+   定义 turtle_recovery 控制台命令、编译源文件、工作队列依赖和单元测试入口。
+4. src/modules/turtle_recovery/turtle_recovery_params.c
+   定义 TRTL_OBS_EN 和 TRTL_AUX 两个参数。前者只允许观察开关触发，后者选择 AUX1 至 AUX6。
+5. src/modules/turtle_recovery/TurtleObserver.hpp
+   三个可独立阅读的逻辑：四元数计算机体向下轴与地面向下轴的对齐值；按 CA_ROTORn_PY 选择右侧逻辑电机；开关 OFF 到 ON 的单次触发。
+6. src/modules/turtle_recovery/TurtleRecovery.cpp
+   模块主体，每 20 ms 更新一次订阅数据；检查数据时效、RC 来源和未解锁状态；收到触发只打印日志；status 显示姿态、角速度和候选电机。
+7. src/modules/turtle_recovery/TurtleObserverTest.cpp
+   六项测试：完整横滚与四元数正负等价；俯仰 90 度；无效姿态；按几何位置选电机；启动或持续 ON 不重复触发；输入无效后重新观察 OFF。
+
+三、阅读顺序与程序流程
+
+建议先读参数文件，再读 TurtleObserver.hpp，最后读 TurtleRecovery.cpp。
+Kconfig 与 CMakeLists.txt 用于让 PX4 找到并编译模块，测试文件用于核对基础行为。
+
+TurtleRecovery::Run()
+  -> 参数发生变化时更新参数和电机几何
+  -> 读取 manual_control_setpoint、vehicle_attitude、vehicle_angular_velocity
+  -> 读取 vehicle_status、vehicle_land_detected
+  -> 选出 TRTL_AUX 指定的 AUX 输入
+  -> 检查 RC 来源、数据有效性和时间戳
+  -> 从四元数计算正反面和倾角
+  -> 读取机体系 X 轴角速度
+  -> 在观察已开启、RC 有效且未解锁时统计 OFF 到 ON 的触发
+  -> 触发时只打印日志
+
+TurtleRecovery::print_status()
+  -> 显示观察是否启用、AUX 数值、OFF 是否已被看到、请求计数
+  -> 显示姿态、角速度、落地检测参考信息
+  -> 显示右侧逻辑电机候选列表
+
+四、参数设置
+
+TRTL_OBS_EN：新增参数，默认 0；设为 1 后允许统计观察开关触发。
+TRTL_AUX：新增参数，默认 1；数值 1 至 6 分别表示 AUX1 至 AUX6。
+RC_MAP_AUX1：已有参数；将一个空闲遥控通道映射到 AUX1。
+本阶段保留现有 DShot、PID、电机几何及转向参数。
+
+以下假设开关位于 CH7，且 AUX1 尚未被其他功能使用。
+如果实际使用其他通道，替换示例中的 7；不要把 7 当作固定要求。
+
+在 QGC MAVLink 控制台执行：
+
+param set RC_MAP_AUX1 7
+param set TRTL_AUX 1
+param set TRTL_OBS_EN 1
+turtle_recovery start
+turtle_recovery status
+
+模块通过控制台手动启动；重启飞控后需要重新执行 start。
+首次启动开关如果已经处于 ON，必须先切到 OFF，再切到 ON。
+更改观察启用状态或 AUX 选择后，同样需要重新观察到 OFF。
+RC 输入无效或失效后，恢复连接并保持 ON 不会直接触发。
+
+停止观察模块：
+
+turtle_recovery stop
+
+关闭观察开关统计：
+
+param set TRTL_OBS_EN 0
+
+五、坐标与状态字段解释
+
+PX4 FRD 机体坐标：X 向机头，Y 向机体右侧，Z 向机体下方。
+本方案固定右翻的数学定义：绕机体 +X 轴正向旋转；正立时表现为右侧向下滚动。
+角速度符号是机体坐标定义，不能用操作者站位或倒扣后看到的屏幕左右判断。
+
+body-down alignment：机体 +Z 轴与地面向下轴的点积。
+  接近 +1：正立。
+  接近 0：侧立。
+  接近 -1：倒扣。
+
+tilt：上述两个方向之间的夹角，以度显示，范围 0 至 180 度。
+它没有记录完整翻转进度；0 到 180 再回到 0 不能区分左翻与右翻。
+当前版本使用它验证正反面，未来控制器还需结合四元数相对旋转和角速度跟踪方向。
+
+roll rate：机体 X 轴角速度，显示单位为度每秒；正值对应本方案规定的右翻方向。
+
+right logical motor mask：按 CA_ROTORn_PY 大于零选出的逻辑电机位掩码。
+当前只识别左右各两台电机的常规四旋翼布局；十字形等其他布局会显示 unsupported。
+标准 PX4 X 型通常对应 Motor 1 和 Motor 4，掩码为 0x9；程序按实际参数选择。
+这些是逻辑电机编号，不等于物理焊盘或输出通道号。
+
+land detector：仅显示落地检测参考信息，本模块没有实现地面判定或电机输出许可。
+observing / requests：只表示开关观察状态和触发计数，不表示已允许翻身。
+invalid/stale：相应数据无效或已过期。
+
+六、拆桨验证步骤
+
+保持未解锁，拆下螺旋桨，在各个姿态停稳后执行 turtle_recovery status。
+1. 正立水平：tilt 接近 0 度，alignment 接近 +1。
+2. 侧立：tilt 接近 90 度，alignment 接近 0。
+3. 倒扣水平：tilt 接近 180 度，alignment 接近 -1。
+4. 正立时让右侧向下滚动：转动期间 roll rate 应为正；停稳后接近 0。
+   角速度是瞬时值，可配合 listener vehicle_angular_velocity 观察转动过程，xyz[0] 单位为弧度每秒。
+5. 开关 OFF 到 ON：requests 增加 1；持续 ON 不重复增加。
+6. 检查 RIGHT (would select) 是否对应实际机体右侧电机，并与 QGC 执行器映射核对。
+
+本阶段不运行电机，也不向电调发送反转或恢复指令。
+完成这些核对之后，下一阶段才开发临时反转、停机、方向恢复和专用输出许可。
+
+七、构建与验证记录
+
+构建命令：
+make micoair_h743-v2_default -j4
+
+生成固件位置：
+build/micoair_h743-v2_default/micoair_h743-v2_default.px4
+
+记录：目标板完整固件编译通过，6 项 TurtleObserver 单元测试通过，代码格式检查通过。
+尚未在真实飞控上验证。生成固件包含当前工作区已有的其他代码修改。
+
+八、如何阅读或使用补丁
+
+下面完整收录本步骤的修改，不要求你在不同源文件之间切换。
+新增行以 + 开头，删除行以 - 开头，未改动的上下文行以空格开头。
++++、---、@@ 和 diff --git 是补丁格式标记，不是源代码。
+新增文件中的全部代码均已收录，包含许可证注释。
+
+同目录 turtle_recovery_stage1.patch 是可供 git apply 使用的原始补丁。
+当前工作区已经包含这些改动，不需要再次应用。
+在尚未包含本次改动、且基础文件匹配的另一份工程根目录中，可以先检查再应用：
+
+git apply --check /path/to/turtle_recovery_stage1.patch
+git apply /path/to/turtle_recovery_stage1.patch
+
+下方为完整补丁内容。代码及参数说明为本次导出时的快照，之后修改源码应重新导出。
+
+文件 1：boards/micoair/h743-v2/default.px4board
+用途：已有文件增加一行 CONFIG_MODULES_TURTLE_RECOVERY=y，把模块编入 Mico H743 V2 固件。这不会让模块自动启动。
+
+diff --git a/boards/micoair/h743-v2/default.px4board b/boards/micoair/h743-v2/default.px4board
+index 9f6d00a5d0..40f624b1f0 100644
+--- a/boards/micoair/h743-v2/default.px4board
++++ b/boards/micoair/h743-v2/default.px4board
+@@ -80,6 +80,7 @@ CONFIG_MODULES_PAYLOAD_DELIVERER=y
+ CONFIG_MODULES_RC_UPDATE=y
+ CONFIG_MODULES_SENSORS=y
+ CONFIG_MODULES_TEMPERATURE_COMPENSATION=y
++CONFIG_MODULES_TURTLE_RECOVERY=y
+ CONFIG_MODULES_UXRCE_DDS_CLIENT=y
+ CONFIG_MODULES_VTOL_ATT_CONTROL=y
+ CONFIG_SYSTEMCMDS_ACTUATOR_TEST=y
+
+文件 2：src/modules/turtle_recovery/Kconfig
+用途：向 PX4 配置系统注册 MODULES_TURTLE_RECOVERY。全局默认关闭，由上面的板级配置选中。
+
+diff --git a/src/modules/turtle_recovery/Kconfig b/src/modules/turtle_recovery/Kconfig
+new file mode 100644
+index 0000000000..9f99d7e7a5
+--- /dev/null
++++ b/src/modules/turtle_recovery/Kconfig
+@@ -0,0 +1,6 @@
++menuconfig MODULES_TURTLE_RECOVERY
++	bool "turtle_recovery"
++	default n
++	---help---
++		Observe RC input, attitude and motor geometry for turtle recovery.
++		This development module does not control actuators or send ESC commands.
+
+文件 3：src/modules/turtle_recovery/CMakeLists.txt
+用途：定义 turtle_recovery 控制台命令、编译源文件、工作队列依赖和单元测试入口。
+
+diff --git a/src/modules/turtle_recovery/CMakeLists.txt b/src/modules/turtle_recovery/CMakeLists.txt
+new file mode 100644
+index 0000000000..0771008a39
+--- /dev/null
++++ b/src/modules/turtle_recovery/CMakeLists.txt
+@@ -0,0 +1,44 @@
++############################################################################
++#
++# Copyright (c) 2026 PX4 Development Team. All rights reserved.
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions
++# are met:
++#
++# 1. Redistributions of source code must retain the above copyright
++#    notice, this list of conditions and the following disclaimer.
++# 2. Redistributions in binary form must reproduce the above copyright
++#    notice, this list of conditions and the following disclaimer in
++#    the documentation and/or other materials provided with the
++#    distribution.
++# 3. Neither the name PX4 nor the names of its contributors may be
++#    used to endorse or promote products derived from this software
++#    without specific prior written permission.
++#
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++# OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++# AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++# POSSIBILITY OF SUCH DAMAGE.
++#
++############################################################################
++
++px4_add_module(
++	MODULE modules__turtle_recovery
++	MAIN turtle_recovery
++	SRCS
++		TurtleRecovery.cpp
++		TurtleObserver.hpp
++	DEPENDS
++		px4_work_queue
++)
++
++px4_add_unit_gtest(SRC TurtleObserverTest.cpp)
+
+文件 4：src/modules/turtle_recovery/turtle_recovery_params.c
+用途：定义 TRTL_OBS_EN 和 TRTL_AUX 两个参数。前者只允许观察开关触发，后者选择 AUX1 至 AUX6。
+
+diff --git a/src/modules/turtle_recovery/turtle_recovery_params.c b/src/modules/turtle_recovery/turtle_recovery_params.c
+new file mode 100644
+index 0000000000..10a72023e6
+--- /dev/null
++++ b/src/modules/turtle_recovery/turtle_recovery_params.c
+@@ -0,0 +1,56 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++
++/**
++ * Enable turtle recovery observation
++ *
++ * Enables RC switch observation only. The turtle_recovery module must be
++ * started manually. It never drives motors or sends ESC commands.
++ *
++ * @boolean
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_INT32(TRTL_OBS_EN, 0);
++
++/**
++ * Turtle observation AUX input
++ *
++ * Selects manual_control_setpoint AUX1 through AUX6. Map a spare RC channel
++ * using the corresponding RC_MAP_AUX parameter. Observe requests require
++ * a valid RC source, a disarmed vehicle, and an OFF to ON switch transition.
++ *
++ * @min 1
++ * @max 6
++ * @group Turtle Recovery
++ */
++PARAM_DEFINE_INT32(TRTL_AUX, 1);
+
+文件 5：src/modules/turtle_recovery/TurtleObserver.hpp
+用途：三个可独立阅读的逻辑：四元数计算机体向下轴与地面向下轴的对齐值；按 CA_ROTORn_PY 选择右侧逻辑电机；开关 OFF 到 ON 的单次触发。
+
+diff --git a/src/modules/turtle_recovery/TurtleObserver.hpp b/src/modules/turtle_recovery/TurtleObserver.hpp
+new file mode 100644
+index 0000000000..594c1d4285
+--- /dev/null
++++ b/src/modules/turtle_recovery/TurtleObserver.hpp
+@@ -0,0 +1,121 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <matrix/matrix/math.hpp>
++
++namespace turtle_recovery
++{
++
++// Alignment of body +Z with earth down. No Euler angle conversion is needed.
++inline bool attitudeAlignment(const float q[4], float &alignment)
++{
++	alignment = NAN;
++	matrix::Quatf attitude{q};
++	const float norm = attitude.norm();
++
++	if (!std::isfinite(norm) || fabsf(norm - 1.f) > 0.02f) {
++		return false;
++	}
++
++	attitude.normalize();
++	alignment = matrix::Dcmf{attitude}(2, 2);
++	return true;
++}
++
++// Logical motor indices, not physical output channels. Only a conventional
++// four-rotor layout with two motors on either side is supported in this stage.
++inline bool rightMotorMask(const float position_y[4], uint32_t &mask)
++{
++	mask = 0;
++	unsigned right_count = 0;
++	unsigned left_count = 0;
++
++	for (unsigned i = 0; i < 4; ++i) {
++		if (!std::isfinite(position_y[i]) || fabsf(position_y[i]) < 1e-4f) {
++			mask = 0;
++			return false;
++		}
++
++		if (position_y[i] > 0.f) {
++			mask |= 1u << i;
++			++right_count;
++
++		} else {
++			++left_count;
++		}
++	}
++
++	if (right_count != 2 || left_count != 2) {
++		mask = 0;
++		return false;
++	}
++
++	return true;
++}
++
++class ObserveTrigger
++{
++public:
++	bool update(bool available, float aux)
++	{
++		if (!available || !std::isfinite(aux) || aux < -1.f || aux > 1.f) {
++			reset();
++			return false;
++		}
++
++		if (aux < -0.5f) {
++			_seen_off = true;
++			_active = false;
++
++		} else if (aux > 0.5f && _seen_off && !_active) {
++			_active = true;
++			return true;
++		}
++
++		return false;
++	}
++
++	void reset() { _seen_off = false; _active = false; }
++	bool active() const { return _active; }
++	bool seenOff() const { return _seen_off; }
++
++private:
++	bool _seen_off{false};
++	bool _active{false};
++};
++
++} // namespace turtle_recovery
+
+文件 6：src/modules/turtle_recovery/TurtleRecovery.cpp
+用途：模块主体，每 20 ms 更新一次订阅数据；检查数据时效、RC 来源和未解锁状态；收到触发只打印日志；status 显示姿态、角速度和候选电机。
+
+diff --git a/src/modules/turtle_recovery/TurtleRecovery.cpp b/src/modules/turtle_recovery/TurtleRecovery.cpp
+new file mode 100644
+index 0000000000..a17c0bc866
+--- /dev/null
++++ b/src/modules/turtle_recovery/TurtleRecovery.cpp
+@@ -0,0 +1,273 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++
++#include "TurtleObserver.hpp"
++
++#include <drivers/drv_hrt.h>
++#include <mathlib/mathlib.h>
++#include <parameters/param.h>
++#include <px4_platform_common/module.h>
++#include <px4_platform_common/module_params.h>
++#include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
++#include <uORB/Subscription.hpp>
++#include <uORB/SubscriptionInterval.hpp>
++#include <uORB/topics/manual_control_setpoint.h>
++#include <uORB/topics/parameter_update.h>
++#include <uORB/topics/vehicle_angular_velocity.h>
++#include <uORB/topics/vehicle_attitude.h>
++#include <uORB/topics/vehicle_land_detected.h>
++#include <uORB/topics/vehicle_status.h>
++
++using namespace time_literals;
++
++class TurtleRecovery : public ModuleBase<TurtleRecovery>, public ModuleParams, public px4::ScheduledWorkItem
++{
++public:
++	TurtleRecovery() : ModuleParams(nullptr), ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::lp_default)
++	{
++		updateGeometry();
++	}
++
++	static int task_spawn(int argc, char *argv[]);
++	static int custom_command(int argc, char *argv[]) { return print_usage("unknown command"); }
++	static int print_usage(const char *reason = nullptr);
++	int print_status() override;
++
++private:
++	void Run() override;
++	void updateGeometry();
++	float auxInput() const;
++	static bool fresh(hrt_abstime now, hrt_abstime timestamp, hrt_abstime timeout)
++	{
++		return timestamp != 0 && now >= timestamp && now - timestamp <= timeout;
++	}
++
++	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
++	uORB::Subscription _manual_sub{ORB_ID(manual_control_setpoint)};
++	uORB::Subscription _attitude_sub{ORB_ID(vehicle_attitude)};
++	uORB::Subscription _angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
++	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
++	uORB::Subscription _land_sub{ORB_ID(vehicle_land_detected)};
++
++	manual_control_setpoint_s _manual{};
++	vehicle_attitude_s _attitude{};
++	vehicle_angular_velocity_s _angular_velocity{};
++	vehicle_status_s _vehicle_status{};
++	vehicle_land_detected_s _land{};
++	turtle_recovery::ObserveTrigger _trigger;
++
++	uint32_t _right_motor_mask{0};
++	unsigned _trigger_count{0};
++	float _position_y[4] {};
++	float _aux{NAN};
++	float _alignment{NAN};
++	float _tilt_deg{NAN};
++	float _roll_rate_deg_s{NAN};
++	bool _geometry_valid{false};
++	bool _rc_valid{false};
++	bool _attitude_valid{false};
++	bool _gyro_valid{false};
++	bool _status_valid{false};
++	bool _land_valid{false};
++
++	DEFINE_PARAMETERS(
++		(ParamBool<px4::params::TRTL_OBS_EN>) _param_obs_en,
++		(ParamInt<px4::params::TRTL_AUX>) _param_aux
++	)
++};
++
++void TurtleRecovery::updateGeometry()
++{
++	_geometry_valid = false;
++	_right_motor_mask = 0;
++	int32_t rotor_count = 0;
++
++	if (param_get(param_find("CA_ROTOR_COUNT"), &rotor_count) != PX4_OK || rotor_count != 4) {
++		return;
++	}
++
++	for (unsigned i = 0; i < 4; ++i) {
++		char name[17];
++		snprintf(name, sizeof(name), "CA_ROTOR%u_PY", i);
++
++		if (param_get(param_find(name), &_position_y[i]) != PX4_OK) {
++			return;
++		}
++	}
++
++	_geometry_valid = turtle_recovery::rightMotorMask(_position_y, _right_motor_mask);
++}
++
++float TurtleRecovery::auxInput() const
++{
++	switch (_param_aux.get()) {
++	case 1: return _manual.aux1;
++
++	case 2: return _manual.aux2;
++
++	case 3: return _manual.aux3;
++
++	case 4: return _manual.aux4;
++
++	case 5: return _manual.aux5;
++
++	case 6: return _manual.aux6;
++
++	default: return NAN;
++	}
++}
++
++void TurtleRecovery::Run()
++{
++	if (should_exit()) {
++		ScheduleClear();
++		exit_and_cleanup();
++		return;
++	}
++
++	if (_parameter_update_sub.updated()) {
++		parameter_update_s update;
++		_parameter_update_sub.copy(&update);
++		const bool previous_enable = _param_obs_en.get();
++		const int32_t previous_aux = _param_aux.get();
++		updateParams();
++		updateGeometry();
++
++		if (previous_enable != _param_obs_en.get() || previous_aux != _param_aux.get()) {
++			_trigger.reset();
++		}
++	}
++
++	_manual_sub.update(&_manual);
++	_attitude_sub.update(&_attitude);
++	_angular_velocity_sub.update(&_angular_velocity);
++	_vehicle_status_sub.update(&_vehicle_status);
++	_land_sub.update(&_land);
++
++	const hrt_abstime now = hrt_absolute_time();
++	_aux = auxInput();
++	_rc_valid = _manual.valid && _manual.data_source == manual_control_setpoint_s::SOURCE_RC
++		    && fresh(now, _manual.timestamp_sample, 300_ms) && PX4_ISFINITE(_aux) && fabsf(_aux) <= 1.f;
++	_status_valid = fresh(now, _vehicle_status.timestamp, 2_s);
++	_land_valid = fresh(now, _land.timestamp, 2_s);
++	_attitude_valid = fresh(now, _attitude.timestamp_sample, 100_ms)
++			  && turtle_recovery::attitudeAlignment(_attitude.q, _alignment);
++	_tilt_deg = _attitude_valid ? math::degrees(acosf(math::constrain(_alignment, -1.f, 1.f))) : NAN;
++
++	if (!_attitude_valid) {
++		_alignment = NAN;
++	}
++
++	_gyro_valid = fresh(now, _angular_velocity.timestamp_sample, 100_ms)
++		      && matrix::Vector3f{_angular_velocity.xyz}.isAllFinite();
++	_roll_rate_deg_s = _gyro_valid ? math::degrees(_angular_velocity.xyz[0]) : NAN;
++
++	const bool switch_available = _param_obs_en.get() && _rc_valid && _status_valid
++				      && _vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_DISARMED;
++
++	if (_trigger.update(switch_available, _aux)) {
++		++_trigger_count;
++		PX4_INFO("Observe request #%u: tilt %.1f deg, right mask 0x%x (no motor output)",
++			 _trigger_count, (double)_tilt_deg, (unsigned)_right_motor_mask);
++	}
++}
++
++int TurtleRecovery::print_status()
++{
++	PX4_INFO("Observation only: no actuator publications or ESC commands");
++	PX4_INFO("Enabled: %s, input: AUX%" PRId32, _param_obs_en.get() ? "yes" : "no", _param_aux.get());
++	PX4_INFO("RC: %s, AUX: %.2f, OFF seen: %s, observing: %s, requests: %u",
++		 _rc_valid ? "valid" : "invalid/stale", (double)_aux, _trigger.seenOff() ? "yes" : "no",
++		 _trigger.active() ? "yes" : "no", _trigger_count);
++	PX4_INFO("Vehicle: %s", !_status_valid ? "unknown/stale" :
++		 (_vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED ? "armed" : "disarmed"));
++	PX4_INFO("Attitude: %s, tilt: %.1f deg, body-down alignment: %.3f", _attitude_valid ? "valid" : "invalid/stale",
++		 (double)_tilt_deg, (double)_alignment);
++	PX4_INFO("Gyro: %s, roll rate: %.1f deg/s (+ = body-right roll)", _gyro_valid ? "valid" : "invalid/stale",
++		 (double)_roll_rate_deg_s);
++	PX4_INFO("Land detector (reference only): %s", !_land_valid ? "unknown/stale" :
++		 (_land.landed ? "landed" : "not landed"));
++	PX4_INFO("Geometry: %s, right logical motor mask: 0x%x", _geometry_valid ? "supported" : "unsupported",
++		 (unsigned)_right_motor_mask);
++
++	if (_geometry_valid) {
++		for (unsigned i = 0; i < 4; ++i) {
++			PX4_INFO("Motor %u: y=%.3f, %s", i + 1, (double)_position_y[i],
++				 (_right_motor_mask & (1u << i)) ? "RIGHT (would select)" : "LEFT");
++		}
++	}
++
++	return PX4_OK;
++}
++
++int TurtleRecovery::task_spawn(int argc, char *argv[])
++{
++	TurtleRecovery *instance = new TurtleRecovery();
++
++	if (instance) {
++		_object.store(instance);
++		_task_id = task_id_is_work_queue;
++		instance->ScheduleOnInterval(20_ms);
++		return PX4_OK;
++	}
++
++	PX4_ERR("alloc failed");
++	return PX4_ERROR;
++}
++
++int TurtleRecovery::print_usage(const char *reason)
++{
++	if (reason) {
++		PX4_WARN("%s", reason);
++	}
++
++	PRINT_MODULE_DESCRIPTION(R"DESCR_STR(
++### Description
++Observe RC input, quaternion attitude, roll rate and right-side motor geometry.
++This development stage has no motor output or ESC command path.
++Enable TRTL_OBS_EN and map a spare RC switch to the AUX input selected by TRTL_AUX.
++Only RC OFF-to-ON transitions while disarmed are counted. Starting with the switch
++ON or recovering from RC loss requires observing OFF before another request.
++Start manually; use status to inspect the inputs. This is not a readiness check
++or an automatic flip controller.
++)DESCR_STR");
++	PRINT_MODULE_USAGE_NAME("turtle_recovery", "system");
++	PRINT_MODULE_USAGE_COMMAND("start");
++	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
++	return PX4_OK;
++}
++
++extern "C" __EXPORT int turtle_recovery_main(int argc, char *argv[])
++{
++	return TurtleRecovery::main(argc, argv);
++}
+
+文件 7：src/modules/turtle_recovery/TurtleObserverTest.cpp
+用途：六项测试：完整横滚与四元数正负等价；俯仰 90 度；无效姿态；按几何位置选电机；启动或持续 ON 不重复触发；输入无效后重新观察 OFF。
+
+diff --git a/src/modules/turtle_recovery/TurtleObserverTest.cpp b/src/modules/turtle_recovery/TurtleObserverTest.cpp
+new file mode 100644
+index 0000000000..5de0b2bad8
+--- /dev/null
++++ b/src/modules/turtle_recovery/TurtleObserverTest.cpp
+@@ -0,0 +1,125 @@
++/****************************************************************************
++ *
++ * Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++
++#include "TurtleObserver.hpp"
++#include <gtest/gtest.h>
++
++using namespace turtle_recovery;
++
++TEST(TurtleObserver, AttitudeAcrossFullRoll)
++{
++	for (int degrees = 0; degrees <= 360; ++degrees) {
++		const float angle = degrees * 0.017453292519943295f;
++		const float q[4] {cosf(angle / 2.f), sinf(angle / 2.f), 0.f, 0.f};
++		const float negative_q[4] {-q[0], -q[1], -q[2], -q[3]};
++		float alignment;
++		float negative_alignment;
++		ASSERT_TRUE(attitudeAlignment(q, alignment));
++		ASSERT_TRUE(attitudeAlignment(negative_q, negative_alignment));
++		EXPECT_NEAR(alignment, cosf(angle), 1e-5f);
++		EXPECT_FLOAT_EQ(alignment, negative_alignment);
++	}
++}
++
++TEST(TurtleObserver, PitchAtEulerSingularity)
++{
++	const float q[4] {sqrtf(0.5f), 0.f, sqrtf(0.5f), 0.f};
++	float alignment;
++	ASSERT_TRUE(attitudeAlignment(q, alignment));
++	EXPECT_NEAR(alignment, 0.f, 1e-5f);
++}
++
++TEST(TurtleObserver, InvalidAttitude)
++{
++	const float zero[4] {};
++	const float invalid[4] {NAN, 0.f, 0.f, 0.f};
++	const float scaled[4] {2.f, 0.f, 0.f, 0.f};
++	float alignment;
++	EXPECT_FALSE(attitudeAlignment(zero, alignment));
++	EXPECT_FALSE(attitudeAlignment(invalid, alignment));
++	EXPECT_FALSE(attitudeAlignment(scaled, alignment));
++	EXPECT_TRUE(std::isnan(alignment));
++}
++
++TEST(TurtleObserver, RightMotorsFollowGeometryInsteadOfMotorNumbers)
++{
++	const float px4_x[4] {1.f, -1.f, -1.f, 1.f};
++	const float remapped[4] {-1.f, 1.f, 1.f, -1.f};
++	const float plus[4] {0.f, -1.f, 1.f, 0.f};
++	const float invalid[4] {NAN, -1.f, -1.f, 1.f};
++	const float asymmetric[4] {1.f, 1.f, 1.f, -1.f};
++	uint32_t mask;
++	ASSERT_TRUE(rightMotorMask(px4_x, mask));
++	EXPECT_EQ(mask, 0x9u);
++	ASSERT_TRUE(rightMotorMask(remapped, mask));
++	EXPECT_EQ(mask, 0x6u);
++	EXPECT_FALSE(rightMotorMask(plus, mask));
++	EXPECT_EQ(mask, 0u);
++	EXPECT_FALSE(rightMotorMask(invalid, mask));
++	EXPECT_EQ(mask, 0u);
++	EXPECT_FALSE(rightMotorMask(asymmetric, mask));
++	EXPECT_EQ(mask, 0u);
++}
++
++TEST(TurtleObserver, StartsOnAndHeldOnDoNotRetrigger)
++{
++	ObserveTrigger trigger;
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	EXPECT_FALSE(trigger.active());
++	EXPECT_FALSE(trigger.update(true, -1.f));
++	EXPECT_TRUE(trigger.update(true, 1.f));
++	EXPECT_TRUE(trigger.active());
++
++	for (int i = 0; i < 100; ++i) {
++		EXPECT_FALSE(trigger.update(true, 1.f));
++	}
++
++	EXPECT_FALSE(trigger.update(true, -1.f));
++	EXPECT_FALSE(trigger.active());
++	EXPECT_TRUE(trigger.update(true, 1.f));
++}
++
++TEST(TurtleObserver, InvalidInputAndUnavailableRequireOffAgain)
++{
++	ObserveTrigger trigger;
++	trigger.update(true, -1.f);
++	ASSERT_TRUE(trigger.update(true, 1.f));
++	EXPECT_FALSE(trigger.update(false, 1.f));
++	EXPECT_FALSE(trigger.active());
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	trigger.update(true, -1.f);
++	EXPECT_FALSE(trigger.update(true, NAN));
++	EXPECT_FALSE(trigger.update(true, 1.f));
++	trigger.update(true, -1.f);
++	EXPECT_TRUE(trigger.update(true, 1.f));
++}
+
+九、实现文件内容校验值 SHA256
+
+c014652ae04f5cac776f7d1a4281d8413303d178023961fb5b2b76ab59fd1957  boards/micoair/h743-v2/default.px4board
+d615c6a371a2f6d6817bb8c63a982e1774061a80e3d9bd3533583c646225f5d5  src/modules/turtle_recovery/Kconfig
+f9fc3b4cf821ecbd3df7bb64aafa9371f77985685b40d6dc7f9fbc2caa61185f  src/modules/turtle_recovery/CMakeLists.txt
+417f0a87ca98df4181521c86dbf8cbab3a5f7c59a6fb4e38495751fbb18594a4  src/modules/turtle_recovery/turtle_recovery_params.c
+f4d63a8d88237cf412dcf149e6cd6ac4801623d4c738a52228aed6efb7719fa9  src/modules/turtle_recovery/TurtleObserver.hpp
+350367c7d374cecd9a69dd24d6b494448a9a4a9b48dacb648463e87168de2c97  src/modules/turtle_recovery/TurtleRecovery.cpp
+a549e251e252f68491845440d41f19606b36fa84b9b1d1d3b6b5d5d60930f702  src/modules/turtle_recovery/TurtleObserverTest.cpp
